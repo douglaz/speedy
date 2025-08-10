@@ -74,7 +74,7 @@
               --target x86_64-unknown-linux-musl \
               --offline \
               -j $NIX_BUILD_CORES \
-              -p speedy
+              --workspace
             
             runHook postBuild
           '';
