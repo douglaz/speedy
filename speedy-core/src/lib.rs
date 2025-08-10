@@ -1,6 +1,6 @@
 //! Speedy Core - A video processing library using FFmpeg CLI
 //!
-//! This library provides tools for video processing by wrapping the FFmpeg 
+//! This library provides tools for video processing by wrapping the FFmpeg
 //! command-line tool, including:
 //! - Speed adjustment with automatic audio pitch correction
 //! - Color grading and enhancement (vibrance, curves, color balance)
