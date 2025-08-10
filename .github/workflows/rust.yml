@@ -18,6 +18,11 @@ jobs:
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -34,10 +39,10 @@ jobs:
         run: cargo fmt --all -- --check
       
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --target x86_64-unknown-linux-musl -- -D warnings
       
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --target x86_64-unknown-linux-musl
 
   test:
     name: Test Suite
@@ -68,7 +73,7 @@ jobs:
             cargo-registry-${{ runner.os }}-
       
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --target x86_64-unknown-linux-musl
       
       - name: Build workspace (musl static binary)
         run: cargo build --workspace --release --target x86_64-unknown-linux-musl
@@ -141,6 +146,8 @@ jobs:
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       
       - name: Install cargo-audit
         run: cargo install cargo-audit
