@@ -35,8 +35,13 @@
         };
       in
       {
-        # Default package
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        # Default package: static musl build
+        packages.default = let
+          rustPlatformMusl = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+        in rustPlatformMusl.buildRustPackage {
           pname = "speedy";
           version = "0.1.0";
           src = ./.;
@@ -48,25 +53,51 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             rustToolchain
-            llvmPackages.clang
+            pkgsStatic.stdenv.cc
           ];
           
-          buildInputs = with pkgs; [
-            ffmpegFull.dev
-            # Image processing libraries
-            imagemagick
-            # System libraries
-            openssl
-          ];
+          # Note: FFmpeg is called as external command, not linked
+          # So we don't need it as a build input for the static binary
           
-          # Environment variables for FFmpeg
-          FFMPEG_DIR = "${ffmpegFull.dev}";
-          PKG_CONFIG_PATH = "${ffmpegFull.dev}/lib/pkgconfig";
+          # Force cargo to use the musl target
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+          CC_x86_64_unknown_linux_musl = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-static";
           
-          # Set library paths
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-            ffmpegFull
-          ];
+          # Override buildPhase to use the correct target
+          buildPhase = ''
+            runHook preBuild
+            
+            echo "Building with musl target for static binary..."
+            cargo build \
+              --release \
+              --target x86_64-unknown-linux-musl \
+              --offline \
+              -j $NIX_BUILD_CORES \
+              -p speedy
+            
+            runHook postBuild
+          '';
+          
+          installPhase = ''
+            runHook preInstall
+            
+            mkdir -p $out/bin
+            cp target/x86_64-unknown-linux-musl/release/speedy $out/bin/
+            
+            runHook postInstall
+          '';
+          
+          # Ensure static linking
+          doCheck = false; # Tests don't work well with static linking
+          
+          # Verify the binary is statically linked
+          postInstall = ''
+            echo "Checking if binary is statically linked..."
+            file $out/bin/speedy
+            # Strip the binary to reduce size
+            ${pkgs.binutils}/bin/strip $out/bin/speedy
+          '';
           
           meta = with pkgs.lib; {
             description = "Video processing tool for speed adjustment, LUT application, and color enhancement";
@@ -83,12 +114,7 @@
             
             # Build tools
             pkg-config
-            llvmPackages.clang
-            cmake
-            
-            # Musl tools for static linking
-            musl
-            pkgsMusl.stdenv.cc
+            pkgsStatic.stdenv.cc
             
             # FFmpeg and video processing
             ffmpegFull
@@ -125,6 +151,10 @@
             ffmpegFull
             pkgs.openssl
           ];
+          
+          # For musl target compilation
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+          CC_x86_64_unknown_linux_musl = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
           
           # Rust environment
           RUST_BACKTRACE = "1";

@@ -22,32 +22,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v24
         with:
-          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
       
-      - name: Install dependencies for musl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-      
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-${{ runner.os }}-
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Build x86_64 Linux (musl - static)
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl
+          nix build
           mkdir -p artifacts/linux-x86_64-static
-          cp target/x86_64-unknown-linux-musl/release/speedy artifacts/linux-x86_64-static/
+          cp result/bin/speedy artifacts/linux-x86_64-static/
           chmod +x artifacts/linux-x86_64-static/speedy
           # Verify it's actually static
           file artifacts/linux-x86_64-static/speedy

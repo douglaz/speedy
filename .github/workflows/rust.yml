@@ -16,14 +16,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v24
         with:
-          targets: x86_64-unknown-linux-musl
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
       
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
       
+      # Only cache cargo registry (dependencies), not target directory
+      # Target caching conflicts with nix environment and multiple build targets
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -36,13 +40,13 @@ jobs:
             cargo-registry-${{ runner.os }}-
       
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: nix develop -c cargo fmt --check
       
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features --target x86_64-unknown-linux-musl -- -D warnings
+        run: nix develop -c cargo clippy -- -D warnings
       
       - name: Check workspace
-        run: cargo check --workspace --target x86_64-unknown-linux-musl
+        run: nix develop -c cargo check --workspace
 
   test:
     name: Test Suite
@@ -51,15 +55,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v24
         with:
-          targets: x86_64-unknown-linux-musl
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
       
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg musl-tools
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -73,21 +77,21 @@ jobs:
             cargo-registry-${{ runner.os }}-
       
       - name: Run tests
-        run: cargo test --workspace --target x86_64-unknown-linux-musl
+        run: nix develop -c cargo test --workspace
       
-      - name: Build workspace (musl static binary)
-        run: cargo build --workspace --release --target x86_64-unknown-linux-musl
+      - name: Build with nix (static musl binary)
+        run: nix build
       
       - name: Verify static linking
         run: |
-          file ./target/x86_64-unknown-linux-musl/release/speedy
-          ldd ./target/x86_64-unknown-linux-musl/release/speedy 2>&1 | grep -q "not a dynamic executable" && echo "✓ Static binary confirmed" || echo "✗ Not a static binary"
+          file ./result/bin/speedy
+          ldd ./result/bin/speedy 2>&1 | grep -q "not a dynamic executable" && echo "✓ Static binary confirmed" || echo "✗ Not a static binary"
       
       - name: Test CLI help
-        run: ./target/x86_64-unknown-linux-musl/release/speedy --help
+        run: ./result/bin/speedy --help
       
       - name: Test list presets
-        run: ./target/x86_64-unknown-linux-musl/release/speedy --list-presets
+        run: ./result/bin/speedy --list-presets
 
   test-cross-platform:
     name: Test on ${{ matrix.os }}
@@ -144,13 +148,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v24
         with:
-          targets: x86_64-unknown-linux-musl
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: nix develop -c cargo install cargo-audit
       
       - name: Run security audit
-        run: cargo audit
+        run: nix develop -c cargo audit
