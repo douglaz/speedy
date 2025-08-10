@@ -48,11 +48,13 @@ jobs:
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       
-      - name: Install FFmpeg
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg musl-tools
       
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -68,14 +70,19 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
       
-      - name: Build workspace
-        run: cargo build --workspace --release
+      - name: Build workspace (musl static binary)
+        run: cargo build --workspace --release --target x86_64-unknown-linux-musl
+      
+      - name: Verify static linking
+        run: |
+          file ./target/x86_64-unknown-linux-musl/release/speedy
+          ldd ./target/x86_64-unknown-linux-musl/release/speedy 2>&1 | grep -q "not a dynamic executable" && echo "✓ Static binary confirmed" || echo "✗ Not a static binary"
       
       - name: Test CLI help
-        run: ./target/release/speedy --help
+        run: ./target/x86_64-unknown-linux-musl/release/speedy --help
       
       - name: Test list presets
-        run: ./target/release/speedy --list-presets
+        run: ./target/x86_64-unknown-linux-musl/release/speedy --list-presets
 
   test-cross-platform:
     name: Test on ${{ matrix.os }}

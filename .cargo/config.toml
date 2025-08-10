@@ -1,0 +1,17 @@
+# Default build configuration for static binaries
+
+[build]
+# Default to musl target for static linking on Linux
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+# Ensure static linking
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+# Static linking for ARM64 Linux
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# For development on non-Linux platforms, you can override with:
+# cargo build --target x86_64-unknown-linux-gnu
+# or set CARGO_BUILD_TARGET environment variable

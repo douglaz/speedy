@@ -41,10 +41,10 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: linux-x86_64
+          - name: linux-x86_64-static
             os: ubuntu-latest
             rust-target: x86_64-unknown-linux-musl
-            artifact-name: speedy-nightly-linux-x86_64
+            artifact-name: speedy-nightly-linux-x86_64-static
             binary-name: speedy
             archive-ext: tar.gz
             
@@ -176,7 +176,7 @@ jobs:
           
           ### Available Binaries
           
-          - `speedy-nightly-linux-x86_64.tar.gz` - Linux x86_64 (static musl build)
+          - `speedy-nightly-linux-x86_64-static.tar.gz` - Linux x86_64 (fully static binary)
           - `speedy-nightly-macos-x86_64.tar.gz` - macOS Intel
           - `speedy-nightly-macos-aarch64.tar.gz` - macOS Apple Silicon
           - `speedy-nightly-windows-x86_64.zip` - Windows x86_64

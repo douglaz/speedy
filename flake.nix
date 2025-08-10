@@ -15,8 +15,12 @@
           overlays = [ (import rust-overlay) ];
         };
         
+        # Use pkgsMusl for static linking
+        pkgsMusl = pkgs.pkgsMusl;
+        
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
+          targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
         };
 
         # FFmpeg with all features for video processing
@@ -82,6 +86,10 @@
             llvmPackages.clang
             cmake
             
+            # Musl tools for static linking
+            musl
+            pkgsMusl.stdenv.cc
+            
             # FFmpeg and video processing
             ffmpegFull
             ffmpegFull.dev
@@ -106,9 +114,6 @@
             # Optional: video analysis tools
             mediainfo
             mkvtoolnix
-            
-            # Optional: LUT tools
-            ociobakelut
           ];
 
           # Environment variables

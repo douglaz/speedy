@@ -43,19 +43,15 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-
       
-      - name: Build x86_64 Linux (glibc)
-        run: |
-          cargo build --release --target x86_64-unknown-linux-gnu
-          mkdir -p artifacts/linux-x86_64-glibc
-          cp target/x86_64-unknown-linux-gnu/release/speedy artifacts/linux-x86_64-glibc/
-          chmod +x artifacts/linux-x86_64-glibc/speedy
-      
       - name: Build x86_64 Linux (musl - static)
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
-          mkdir -p artifacts/linux-x86_64-musl
-          cp target/x86_64-unknown-linux-musl/release/speedy artifacts/linux-x86_64-musl/
-          chmod +x artifacts/linux-x86_64-musl/speedy
+          mkdir -p artifacts/linux-x86_64-static
+          cp target/x86_64-unknown-linux-musl/release/speedy artifacts/linux-x86_64-static/
+          chmod +x artifacts/linux-x86_64-static/speedy
+          # Verify it's actually static
+          file artifacts/linux-x86_64-static/speedy
+          ldd artifacts/linux-x86_64-static/speedy 2>&1 | grep -q "not a dynamic executable" && echo "✓ Static binary" || exit 1
       
       - name: Create checksums
         run: |
@@ -240,8 +236,7 @@ jobs:
           Choose the appropriate binary for your platform:
           
           **Linux:**
-          - `speedy-linux-x86_64-glibc.tar.gz` - Standard Linux binary (requires glibc)
-          - `speedy-linux-x86_64-musl.tar.gz` - Static binary (works on all Linux distros)
+          - `speedy-linux-x86_64-static.tar.gz` - Fully static binary (works on all Linux distros, no dependencies)
           
           **macOS:**
           - `speedy-macos-x86_64.tar.gz` - Intel Mac binary
