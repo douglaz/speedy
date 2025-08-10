@@ -17,18 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v23
         with:
-          components: llvm-tools-preview
+          nix_path: nixpkgs=channel:nixos-unstable
       
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v12
+        with:
+          name: nix-community
+          skipPush: true
       
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov
+        run: nix develop -c cargo install cargo-llvm-cov
       
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -42,7 +43,7 @@ jobs:
             cargo-registry-${{ runner.os }}-
       
       - name: Generate code coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: nix develop -c cargo llvm-cov --workspace --lcov --output-path lcov.info
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
