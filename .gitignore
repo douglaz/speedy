@@ -31,3 +31,6 @@ processed/
 
 # Cargo.lock is needed for Nix builds
 # Cargo.lock
+
+# Nix build result
+result
