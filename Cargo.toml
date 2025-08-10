@@ -1,0 +1,36 @@
+[workspace]
+members = ["speedy-core", "speedy-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Speedy Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/speedy"
+
+[workspace.dependencies]
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Text processing
+regex = "1.11"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Progress bars
+indicatif = "0.17"
+
+
+# Async runtime
+tokio = { version = "1.39", features = ["full"] }

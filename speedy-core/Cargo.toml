@@ -1,0 +1,34 @@
+[package]
+name = "speedy-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core video processing library with FFmpeg integration"
+
+[features]
+default = []
+
+[dependencies]
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+log = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Text processing
+regex = { workspace = true }
+
+
+
+# Progress reporting
+indicatif = { workspace = true }
+
+# CLI support (for ColorProfile ValueEnum)
+clap = { workspace = true }

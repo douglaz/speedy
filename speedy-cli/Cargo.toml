@@ -1,0 +1,29 @@
+[package]
+name = "speedy-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for speedy video processing tool"
+
+[[bin]]
+name = "speedy"
+path = "src/main.rs"
+
+[dependencies]
+# Core library
+speedy-core = { path = "../speedy-core" }
+
+# CLI argument parsing
+clap = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+env_logger = { workspace = true }
+log = { workspace = true }
+
+# Async runtime (for potential future async operations)
+tokio = { workspace = true }
