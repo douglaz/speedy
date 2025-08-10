@@ -29,5 +29,5 @@ Thumbs.db
 output/
 processed/
 
-# Cargo lock for libraries
-Cargo.lock
+# Cargo.lock is needed for Nix builds
+# Cargo.lock
