@@ -1,0 +1,202 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-changes:
+    name: Check for recent changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for commits in last 24 hours
+        id: check
+        run: |
+          if [[ $(git log --since="24 hours ago" --oneline) ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Recent changes found, proceeding with nightly build"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "No recent changes, skipping nightly build"
+          fi
+
+  build:
+    name: Nightly Build (${{ matrix.target.name }})
+    needs: check-changes
+    if: needs.check-changes.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.target.os }}
+    
+    strategy:
+      matrix:
+        target:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-musl
+            artifact-name: speedy-nightly-linux-x86_64
+            binary-name: speedy
+            archive-ext: tar.gz
+            
+          - name: macos-x86_64
+            os: macos-latest
+            rust-target: x86_64-apple-darwin
+            artifact-name: speedy-nightly-macos-x86_64
+            binary-name: speedy
+            archive-ext: tar.gz
+            
+          - name: macos-aarch64
+            os: macos-latest
+            rust-target: aarch64-apple-darwin
+            artifact-name: speedy-nightly-macos-aarch64
+            binary-name: speedy
+            archive-ext: tar.gz
+            
+          - name: windows-x86_64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            artifact-name: speedy-nightly-windows-x86_64
+            binary-name: speedy.exe
+            archive-ext: zip
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target.rust-target }}
+      
+      - name: Install musl tools (Linux)
+        if: matrix.target.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+      
+      - name: Build with nightly features
+        run: |
+          cargo +nightly build --release --target ${{ matrix.target.rust-target }}
+      
+      - name: Prepare artifacts (Unix)
+        if: matrix.target.os != 'windows-latest'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target.rust-target }}/release/${{ matrix.target.binary-name }} dist/
+          chmod +x dist/${{ matrix.target.binary-name }}
+          cd dist
+          tar czf ../${{ matrix.target.artifact-name }}.tar.gz *
+      
+      - name: Prepare artifacts (Windows)
+        if: matrix.target.os == 'windows-latest'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/${{ matrix.target.rust-target }}/release/${{ matrix.target.binary-name }} dist/
+          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.target.artifact-name }}.zip
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact-name }}
+          path: ${{ matrix.target.artifact-name }}.${{ matrix.target.archive-ext }}
+          retention-days: 7
+
+  update-nightly-release:
+    name: Update Nightly Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release-files/ \;
+          ls -la release-files/
+      
+      - name: Get date and commit
+        id: info
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      
+      - name: Create release notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          ## Speedy Nightly Build
+          
+          **Build Date:** ${{ steps.info.outputs.date }}  
+          **Commit:** ${{ steps.info.outputs.sha_short }}  
+          **Rust Version:** Nightly
+          
+          ### ⚠️ Warning
+          
+          This is an automated nightly build using Rust nightly compiler. It may include:
+          - Experimental features
+          - Unstable optimizations
+          - Potential bugs
+          
+          **For production use, please use the stable releases instead.**
+          
+          ### Installation
+          
+          Requires FFmpeg to be installed on your system.
+          
+          1. Download the appropriate binary for your platform
+          2. Extract the archive
+          3. Make executable (Unix): `chmod +x speedy`
+          4. Run: `./speedy --help`
+          
+          ### Available Binaries
+          
+          - `speedy-nightly-linux-x86_64.tar.gz` - Linux x86_64 (static musl build)
+          - `speedy-nightly-macos-x86_64.tar.gz` - macOS Intel
+          - `speedy-nightly-macos-aarch64.tar.gz` - macOS Apple Silicon
+          - `speedy-nightly-windows-x86_64.zip` - Windows x86_64
+          
+          EOF
+      
+      - name: Delete existing nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --yes 2>/dev/null || true
+          git push --delete origin nightly 2>/dev/null || true
+      
+      - name: Create nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create nightly \
+            --title "Nightly Build (${{ steps.info.outputs.date }})" \
+            --notes-file release-notes.md \
+            --prerelease \
+            --target main \
+            release-files/*
