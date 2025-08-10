@@ -130,6 +130,9 @@
           RUST_BACKTRACE = "1";
           RUST_LOG = "info";
           
+          # Ensure build scripts use the host target
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgsMusl.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
+          
           shellHook = ''
             echo "Welcome to Speedy development environment!"
             echo ""

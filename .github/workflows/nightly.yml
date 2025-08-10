@@ -102,6 +102,10 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-
       
+      - name: Add musl target (Linux)
+        if: matrix.target.os == 'ubuntu-latest'
+        run: nix develop -c rustup target add ${{ matrix.target.rust-target }}
+      
       - name: Build with nightly features (Linux)
         if: matrix.target.os == 'ubuntu-latest'
         run: |

@@ -33,6 +33,9 @@ jobs:
           name: nix-community
           skipPush: true
       
+      - name: Add musl target
+        run: nix develop -c rustup target add x86_64-unknown-linux-musl
+      
       - name: Build x86_64 Linux (musl - static)
         run: |
           nix develop -c cargo build --release --target x86_64-unknown-linux-musl

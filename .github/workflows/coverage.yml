@@ -31,6 +31,9 @@ jobs:
       - name: Install cargo-llvm-cov
         run: nix develop -c cargo install cargo-llvm-cov
       
+      - name: Add musl target
+        run: nix develop -c rustup target add x86_64-unknown-linux-musl
+      
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:

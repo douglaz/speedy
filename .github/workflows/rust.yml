@@ -30,6 +30,9 @@ jobs:
       - name: Check formatting
         run: nix develop -c cargo fmt --all -- --check
       
+      - name: Add musl target
+        run: nix develop -c rustup target add x86_64-unknown-linux-musl
+      
       - name: Run clippy
         run: nix develop -c cargo clippy --all-targets --all-features --target x86_64-unknown-linux-musl -- -D warnings
       
@@ -53,6 +56,9 @@ jobs:
         with:
           name: nix-community
           skipPush: true
+      
+      - name: Add musl target
+        run: nix develop -c rustup target add x86_64-unknown-linux-musl
       
       - name: Run tests
         run: nix develop -c cargo test --workspace --target x86_64-unknown-linux-musl
