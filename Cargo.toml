@@ -33,4 +33,4 @@ indicatif = "0.18"
 
 
 # Async runtime
-tokio = { version = "1.39", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
