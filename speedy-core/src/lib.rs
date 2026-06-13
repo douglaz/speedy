@@ -20,7 +20,7 @@ pub use video_processor::VideoProcessor;
 
 use clap::ValueEnum;
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum ColorProfile {
     Standard,
     DLog,

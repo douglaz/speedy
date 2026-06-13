@@ -9,7 +9,7 @@ use std::thread;
 /// FFmpeg command builder with fluent interface
 #[derive(Debug, Clone)]
 pub struct FFmpegCommand {
-    input: PathBuf,
+    inputs: Vec<PathBuf>,
     output: PathBuf,
     video_filters: Vec<String>,
     audio_filters: Vec<String>,
@@ -23,12 +23,26 @@ pub struct FFmpegCommand {
     extra_args: Vec<String>,
     metadata_args: Vec<String>,
     hw_accel: Option<String>,
+    /// When set (with multiple inputs), each input is normalized to this
+    /// `(width, height, fps)` and concatenated via the concat filter so clips
+    /// of differing resolution/orientation can be stitched into one output.
+    concat_normalize: Option<(u32, u32, String)>,
+    /// Known total duration in seconds, used for progress because the concat
+    /// filter does not produce a single `Duration` line FFmpeg can report.
+    total_duration: Option<f64>,
 }
 
 impl FFmpegCommand {
     pub fn new(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Self {
+        Self::new_multi(vec![input.as_ref().to_path_buf()], output)
+    }
+
+    /// Create a command with multiple inputs. When combined with
+    /// [`concat_normalize`](Self::concat_normalize) the inputs are stitched
+    /// together into a single output.
+    pub fn new_multi(inputs: Vec<PathBuf>, output: impl AsRef<Path>) -> Self {
         Self {
-            input: input.as_ref().to_path_buf(),
+            inputs,
             output: output.as_ref().to_path_buf(),
             video_filters: Vec::new(),
             audio_filters: Vec::new(),
@@ -42,7 +56,27 @@ impl FFmpegCommand {
             extra_args: Vec::new(),
             metadata_args: Vec::new(),
             hw_accel: None,
+            concat_normalize: None,
+            total_duration: None,
         }
+    }
+
+    /// Stitch multiple inputs into one output: each input is scaled (preserving
+    /// aspect, padded if needed), auto-rotated, set to `fps`, then concatenated.
+    /// Any configured video filters (e.g. a LUT) are applied once after the join.
+    ///
+    /// Note: the stitched output is currently video-only; audio tracks are not
+    /// concatenated.
+    pub fn concat_normalize(mut self, width: u32, height: u32, fps: &str) -> Self {
+        self.concat_normalize = Some((width, height, fps.to_string()));
+        self
+    }
+
+    /// Provide a known total duration (seconds) for progress reporting.
+    /// Needed for concat, where FFmpeg cannot report a single Duration line.
+    pub fn total_duration(mut self, seconds: f64) -> Self {
+        self.total_duration = Some(seconds);
+        self
     }
 
     /// Set video codec
@@ -293,6 +327,17 @@ impl FFmpegCommand {
         self
     }
 
+    /// Pixel format the filtered stream is normalized to before encoding.
+    /// ProRes needs 10-bit 4:2:2; web codecs (H.264/H.265/VP9/AV1) use 8-bit
+    /// 4:2:0. This is what converts the RGB output of filters like lut3d back to
+    /// something the encoder accepts.
+    fn output_pixel_format(&self) -> &'static str {
+        match self.video_codec.as_deref() {
+            Some(codec) if codec.contains("prores") => "yuv422p10le",
+            _ => "yuv420p",
+        }
+    }
+
     /// Build the FFmpeg command
     pub fn build(&self) -> Command {
         let mut cmd = Command::new("ffmpeg");
@@ -302,47 +347,91 @@ impl FFmpegCommand {
             cmd.arg("-y");
         }
 
-        // Hardware acceleration
+        // Hardware acceleration (applies to the inputs that follow)
         if let Some(ref hw) = self.hw_accel {
             cmd.args(["-hwaccel", hw]);
         }
 
-        // Input file (autorotate is enabled by default)
-        cmd.args(["-i", self.input.to_str().unwrap()]);
-
-        // Build filter complex if we have filters
-        let mut filter_complex = String::new();
-        let mut has_video_filters = false;
-        let mut has_audio_filters = false;
-
-        if !self.video_filters.is_empty() {
-            filter_complex.push_str(&format!("[0:v]{}[v]", self.video_filters.join(",")));
-            has_video_filters = true;
+        // Input files (autorotation is enabled by default for each).
+        // Pass the path as an OsStr so non-UTF-8 paths don't panic.
+        for input in &self.inputs {
+            cmd.arg("-i").arg(input);
         }
 
-        if !self.audio_filters.is_empty() {
-            if has_video_filters {
-                filter_complex.push_str("; ");
+        let video_chain = self.video_filters.join(",");
+        let out_fmt = self.output_pixel_format();
+
+        if let Some((w, h, ref fps)) = self.concat_normalize {
+            // Stitch mode: normalize every input to a common size/fps (scaling
+            // down to fit and padding to keep aspect), concatenate them, then
+            // apply the shared video filter chain (e.g. the LUT) once.
+            let n = self.inputs.len();
+            let mut graph = String::new();
+            for i in 0..n {
+                // setpts=PTS-STARTPTS rebases each segment to start at 0, which
+                // the concat filter requires; otherwise clips with non-zero
+                // start PTS (trimmed sources, MP4 edit lists) can produce gaps
+                // or non-monotonic-timestamp failures.
+                graph.push_str(&format!(
+                    "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
+                     pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},\
+                     setpts=PTS-STARTPTS[v{i}];"
+                ));
             }
-            filter_complex.push_str(&format!("[0:a]{}[a]", self.audio_filters.join(",")));
-            has_audio_filters = true;
-        }
+            for i in 0..n {
+                graph.push_str(&format!("[v{i}]"));
+            }
+            graph.push_str(&format!("concat=n={n}:v=1[cat]"));
+            // Normalize to a codec-friendly pixel format: RGB-producing filters
+            // such as lut3d would otherwise leave the stream as gbrp (planar
+            // RGB), which many encoders/players cannot handle.
+            if video_chain.is_empty() {
+                graph.push_str(&format!(";[cat]format={out_fmt}[v]"));
+            } else {
+                graph.push_str(&format!(";[cat]{video_chain},format={out_fmt}[v]"));
+            }
 
-        if !filter_complex.is_empty() {
             cmd.arg("-filter_complex");
-            cmd.arg(&filter_complex);
+            cmd.arg(&graph);
+            // Stitched clips are treated as video-only (no synchronized audio).
+            cmd.args(["-map", "[v]"]);
+        } else {
+            // Single-input mode: apply video/audio filters to input 0.
+            let mut filter_complex = String::new();
+            let mut has_video_filters = false;
+            let mut has_audio_filters = false;
 
-            // Map the filtered outputs
-            if has_video_filters {
-                cmd.args(["-map", "[v]"]);
-            } else {
-                cmd.args(["-map", "0:v?"]);
+            if !self.video_filters.is_empty() {
+                // The trailing format guards against RGB-producing filters (e.g.
+                // lut3d) leaving the output as gbrp, which breaks many encoders.
+                filter_complex.push_str(&format!("[0:v]{video_chain},format={out_fmt}[v]"));
+                has_video_filters = true;
             }
 
-            if has_audio_filters {
-                cmd.args(["-map", "[a]"]);
-            } else {
-                cmd.args(["-map", "0:a?"]);
+            if !self.audio_filters.is_empty() {
+                if has_video_filters {
+                    filter_complex.push_str("; ");
+                }
+                filter_complex.push_str(&format!("[0:a]{}[a]", self.audio_filters.join(",")));
+                has_audio_filters = true;
+            }
+
+            if !filter_complex.is_empty() {
+                cmd.arg("-filter_complex");
+                cmd.arg(&filter_complex);
+
+                // Map the filtered outputs
+                if has_video_filters {
+                    cmd.args(["-map", "[v]"]);
+                } else {
+                    cmd.args(["-map", "0:v?"]);
+                }
+
+                if has_audio_filters {
+                    cmd.args(["-map", "[a]"]);
+                } else {
+                    cmd.args(["-map", "0:a?"]);
+                }
             }
         }
 
@@ -384,8 +473,8 @@ impl FFmpegCommand {
             cmd.arg(arg);
         }
 
-        // Output file
-        cmd.arg(self.output.to_str().unwrap());
+        // Output file (passed as an OsStr to support non-UTF-8 paths)
+        cmd.arg(&self.output);
 
         cmd
     }
@@ -414,13 +503,17 @@ impl FFmpegCommand {
 
         let (tx, rx) = mpsc::channel();
 
+        // Use the caller-provided duration when available (e.g. concat input,
+        // where FFmpeg cannot report a real Duration line).
+        let total_override = self.total_duration;
+
         // Spawn thread to read stderr and parse progress
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stderr);
             let duration_regex = Regex::new(r"Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})").unwrap();
             let progress_regex = Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})").unwrap();
 
-            let mut total_duration: Option<f64> = None;
+            let mut total_duration: Option<f64> = total_override;
             let mut all_output = String::new();
 
             for line in reader.lines().map_while(Result::ok) {
@@ -516,8 +609,8 @@ pub fn get_video_info(path: impl AsRef<Path>) -> Result<VideoInfo> {
             "json",
             "-show_format",
             "-show_streams",
-            path.as_ref().to_str().unwrap(),
         ])
+        .arg(path.as_ref())
         .output()
         .context("Failed to run ffprobe")?;
 
@@ -583,4 +676,114 @@ pub struct VideoInfo {
     pub fps: f64,
     pub rotation: i32,
     pub has_audio: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect the built command's arguments as owned strings for inspection.
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Extract the value passed to `-filter_complex`, if any.
+    fn filter_complex(args: &[String]) -> Option<&String> {
+        let idx = args.iter().position(|a| a == "-filter_complex")?;
+        args.get(idx + 1)
+    }
+
+    fn has_pair(args: &[String], first: &str, second: &str) -> bool {
+        args.windows(2).any(|w| w[0] == first && w[1] == second)
+    }
+
+    #[test]
+    fn single_input_without_filters_has_no_filter_complex() {
+        let args = args_of(&FFmpegCommand::new("in.mp4", "out.mp4").build());
+        assert!(!args.iter().any(|a| a == "-filter_complex"));
+        assert!(has_pair(&args, "-i", "in.mp4"));
+    }
+
+    #[test]
+    fn single_input_with_lut_forces_yuv420p() -> Result<()> {
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .lut3d("grade.cube")
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        // The LUT runs in RGB; the chain must end in yuv420p for compatibility.
+        assert_eq!(fc, "[0:v]lut3d=grade.cube,format=yuv420p[v]");
+        assert!(has_pair(&args, "-map", "[v]"));
+        Ok(())
+    }
+
+    #[test]
+    fn concat_normalize_builds_join_graph() -> Result<()> {
+        let inputs = vec![
+            PathBuf::from("a.mp4"),
+            PathBuf::from("b.mp4"),
+            PathBuf::from("c.mp4"),
+        ];
+        let args = args_of(
+            &FFmpegCommand::new_multi(inputs, "out.mp4")
+                .lut3d("grade.cube")
+                .concat_normalize(3840, 2160, "30")
+                .build(),
+        );
+
+        // One -i per input.
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-i").count(), 3);
+
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        for i in 0..3 {
+            assert!(
+                fc.contains(&format!(
+                    "[{i}:v]scale=3840:2160:force_original_aspect_ratio=decrease"
+                )),
+                "missing normalize chain for input {i}: {fc}"
+            );
+        }
+        // Each segment must be rebased to start at PTS 0 for the concat filter.
+        assert!(fc.contains("setpts=PTS-STARTPTS[v0]"), "graph: {fc}");
+        assert!(fc.contains("concat=n=3:v=1[cat]"), "graph: {fc}");
+        assert!(
+            fc.contains("[cat]lut3d=grade.cube,format=yuv420p[v]"),
+            "graph: {fc}"
+        );
+        assert!(has_pair(&args, "-map", "[v]"));
+        Ok(())
+    }
+
+    #[test]
+    fn prores_codec_keeps_10bit_422_pixel_format() -> Result<()> {
+        // ProRes does not support yuv420p; forcing it would degrade or fail.
+        let args = args_of(
+            &FFmpegCommand::new("in.mov", "out.mov")
+                .video_codec("prores_ks")
+                .lut3d("grade.cube")
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(fc.ends_with("format=yuv422p10le[v]"), "fc: {fc}");
+        Ok(())
+    }
+
+    #[test]
+    fn concat_normalize_without_filters_still_outputs_yuv420p() -> Result<()> {
+        let inputs = vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")];
+        let args = args_of(
+            &FFmpegCommand::new_multi(inputs, "out.mp4")
+                .concat_normalize(1920, 1080, "30")
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(
+            fc.contains("concat=n=2:v=1[cat];[cat]format=yuv420p[v]"),
+            "graph: {fc}"
+        );
+        Ok(())
+    }
 }

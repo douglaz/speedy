@@ -8,7 +8,10 @@ use crate::{ColorProfile, FFmpegCommand, check_ffmpeg, get_video_info};
 type ColorBalanceValues = (f32, f32, f32, f32, f32, f32, f32, f32, f32);
 
 pub struct VideoProcessor {
-    input_path: PathBuf,
+    /// One or more input clips. When more than one is given they are stitched
+    /// together (in order) into a single output via the concat filter, with each
+    /// clip normalized to a common resolution first.
+    inputs: Vec<PathBuf>,
     output_path: PathBuf,
     speed_multiplier: f64,
     codec: String,
@@ -34,8 +37,14 @@ pub struct VideoProcessor {
 
 impl VideoProcessor {
     pub fn new(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Self {
+        Self::new_multi(vec![input.as_ref().to_path_buf()], output)
+    }
+
+    /// Create a processor that stitches multiple input clips into one output.
+    /// The clips are concatenated in the order given.
+    pub fn new_multi(inputs: Vec<PathBuf>, output: impl AsRef<Path>) -> Self {
         Self {
-            input_path: input.as_ref().to_path_buf(),
+            inputs,
             output_path: output.as_ref().to_path_buf(),
             speed_multiplier: 1.0,
             codec: "libx264".to_string(),
@@ -188,48 +197,45 @@ impl VideoProcessor {
         self
     }
 
-    /// Get the appropriate LUT file for the color profile
+    /// Get the appropriate LUT file for the color profile, if one is available.
+    ///
+    /// A missing profile LUT is not fatal: the LUT assets are not shipped with
+    /// the repository (they are git-ignored), so we log a warning and skip the
+    /// color conversion rather than aborting, letting the other preset
+    /// adjustments still apply.
     fn get_profile_lut(&self) -> Option<PathBuf> {
-        match self.profile {
-            ColorProfile::DLog => {
-                // Check for built-in D-Log LUT
-                let lut_path = PathBuf::from("luts/dji_dlog_to_rec709.cube");
-                if lut_path.exists() {
-                    Some(lut_path)
-                } else {
-                    log::warn!("D-Log LUT not found at luts/dji_dlog_to_rec709.cube");
-                    None
-                }
-            }
-            ColorProfile::SLog => {
-                let lut_path = PathBuf::from("luts/sony_slog_to_rec709.cube");
-                if lut_path.exists() {
-                    Some(lut_path)
-                } else {
-                    None
-                }
-            }
-            ColorProfile::CLog => {
-                let lut_path = PathBuf::from("luts/canon_clog_to_rec709.cube");
-                if lut_path.exists() {
-                    Some(lut_path)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let (path, label) = match self.profile {
+            ColorProfile::DLog => ("luts/mavic4_pro_dlog_to_rec709.cube", "D-Log"),
+            ColorProfile::SLog => ("luts/sony_slog_to_rec709.cube", "S-Log"),
+            ColorProfile::CLog => ("luts/canon_clog_to_rec709.cube", "C-Log"),
+            _ => return None,
+        };
+
+        let lut_path = PathBuf::from(path);
+        if lut_path.exists() {
+            Some(lut_path)
+        } else {
+            log::warn!("{label} LUT not found at {path}; skipping color conversion");
+            None
         }
     }
 
     /// Process the video using FFmpeg CLI
     pub fn process(&self) -> Result<()> {
+        // Guard the indexing below: library callers can construct an empty
+        // processor via `new_multi`, which the CLI never does.
+        if self.inputs.is_empty() {
+            anyhow::bail!("No input files provided");
+        }
+
         // Check FFmpeg availability
         let ffmpeg_version = check_ffmpeg()?;
         log::info!("Using FFmpeg version: {}", ffmpeg_version);
 
-        // Get video info
+        // Get video info from the first clip (all stitched clips are assumed to
+        // share the same format, as they come from the same camera/source).
         log::info!("Analyzing input video...");
-        let info = get_video_info(&self.input_path)?;
+        let info = get_video_info(&self.inputs[0])?;
         log::info!(
             "Video info: {}x{}, {:.2} fps, {:.2}s duration, rotation: {}°, audio: {}",
             info.width,
@@ -240,12 +246,61 @@ impl VideoProcessor {
             if info.has_audio { "yes" } else { "no" }
         );
 
-        // Build FFmpeg command
-        let mut cmd = FFmpegCommand::new(&self.input_path, &self.output_path)
-            .video_codec(&self.codec)
-            .quality(self.quality)
-            .overwrite()
-            .preserve_metadata();
+        // When multiple clips are given, probe every clip so we can pick a
+        // common output resolution and sum the durations (for the progress bar).
+        let stitching = self.inputs.len() > 1;
+        let stitch_plan = if stitching {
+            let infos = self
+                .inputs
+                .iter()
+                .map(get_video_info)
+                .collect::<Result<Vec<_>>>()?;
+            let total: f64 = infos.iter().map(|i| i.duration).sum();
+            // Target the smallest display size across clips so nothing is
+            // upscaled; clips of other sizes are scaled to fit and padded.
+            let (width, height) = infos
+                .iter()
+                .map(display_dimensions)
+                .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
+                .unwrap_or((info.width, info.height));
+            log::info!(
+                "Stitching {} clips ({total:.2}s total) at {width}x{height} into {:?}",
+                self.inputs.len(),
+                self.output_path
+            );
+            // Stitching currently produces a video-only output; warn loudly so
+            // dropped audio is never a silent surprise.
+            if infos.iter().any(|i| i.has_audio) {
+                log::warn!(
+                    "Some input clips have audio, but stitched output is video-only; audio will be dropped"
+                );
+            }
+            Some((width, height, total))
+        } else {
+            None
+        };
+
+        // Build FFmpeg command. In stitch mode all inputs are passed together;
+        // otherwise just the single clip.
+        let mut cmd = if stitch_plan.is_some() {
+            FFmpegCommand::new_multi(self.inputs.clone(), &self.output_path)
+        } else {
+            FFmpegCommand::new(&self.inputs[0], &self.output_path)
+        }
+        .video_codec(&self.codec)
+        .quality(self.quality)
+        .overwrite()
+        .preserve_metadata();
+
+        if let Some((width, height, total)) = stitch_plan {
+            // Probe the first video stream's frame rate specifically, so a file
+            // whose first stream is audio/data does not feed a bogus fps into
+            // the concat graph.
+            let fps = probe_video_fps(&self.inputs[0], info.fps);
+            cmd = cmd
+                .concat_normalize(width, height, &fps)
+                .total_duration(total);
+        }
 
         // Set bitrate if specified
         if let Some(bitrate) = self.bitrate {
@@ -284,8 +339,9 @@ impl VideoProcessor {
             cmd = cmd.lut3d(lut);
         } else if let Some(profile_lut) = self.get_profile_lut() {
             log::info!(
-                "Applying {profile} profile LUT",
-                profile = self.profile.to_string()
+                "Applying {} profile LUT: {}",
+                self.profile.to_string(),
+                profile_lut.display()
             );
             cmd = cmd.lut3d(profile_lut);
         }
@@ -393,5 +449,96 @@ impl VideoProcessor {
         log::info!("Output saved to: {:?}", self.output_path);
 
         Ok(())
+    }
+}
+
+/// Probe the first *video* stream's frame rate as an ffmpeg-ready string (e.g.
+/// `"30000/1001"`). Falls back to the formatted `default` when the value is
+/// missing or degenerate (e.g. a non-video first stream reporting `0/0`).
+fn probe_video_fps(path: &Path, default: f64) -> String {
+    let probed = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    if let Some(rate) = probed
+        && let Some((num, den)) = rate.split_once('/')
+        && let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>())
+        && num > 0.0
+        && den > 0.0
+    {
+        return rate;
+    }
+
+    format!("{default:.5}")
+}
+
+/// Display dimensions of a clip, accounting for a 90°/270° rotation flag
+/// (cameras often store rotated footage with a rotation tag).
+fn display_dimensions(info: &crate::VideoInfo) -> (u32, u32) {
+    if info.rotation.abs() % 180 == 90 {
+        (info.height, info.width)
+    } else {
+        (info.width, info.height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VideoInfo;
+
+    fn info(width: u32, height: u32, rotation: i32) -> VideoInfo {
+        VideoInfo {
+            duration: 0.0,
+            width,
+            height,
+            fps: 30.0,
+            rotation,
+            has_audio: false,
+        }
+    }
+
+    #[test]
+    fn display_dimensions_swap_on_quarter_turns_only() {
+        // Upright / half-turn: dimensions stay as stored.
+        assert_eq!(display_dimensions(&info(3840, 2160, 0)), (3840, 2160));
+        assert_eq!(display_dimensions(&info(3840, 2160, 180)), (3840, 2160));
+        // Quarter turns (camera stored the frame rotated): width/height swap.
+        assert_eq!(display_dimensions(&info(3384, 6016, -90)), (6016, 3384));
+        assert_eq!(display_dimensions(&info(3384, 6016, 90)), (6016, 3384));
+        assert_eq!(display_dimensions(&info(3384, 6016, 270)), (6016, 3384));
+    }
+
+    #[test]
+    fn missing_profile_lut_degrades_to_none() {
+        // LUT assets are git-ignored and not shipped, so a log profile whose
+        // LUT is absent must skip color conversion (None) rather than abort.
+        let lut = PathBuf::from("luts/mavic4_pro_dlog_to_rec709.cube");
+        if lut.exists() {
+            // Skip when a developer happens to have the LUT present locally.
+            return;
+        }
+        let processor = VideoProcessor::new("in.mp4", "out.mp4").profile(crate::ColorProfile::DLog);
+        assert_eq!(processor.get_profile_lut(), None);
+    }
+
+    #[test]
+    fn process_rejects_empty_inputs() {
+        // A library caller can build an empty processor; it must return an
+        // error rather than panicking on input indexing.
+        let result = VideoProcessor::new_multi(Vec::new(), "out.mp4").process();
+        assert!(result.is_err(), "empty inputs should error, not panic");
     }
 }

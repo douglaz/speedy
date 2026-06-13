@@ -2,8 +2,8 @@ use crate::{ColorProfile, VideoProcessor};
 
 /// Preset configurations for common video processing workflows
 pub enum Preset {
-    /// DJI drone footage with D-Log profile
-    DjiDLog,
+    /// DJI Mavic 4 Pro footage with D-Log profile
+    Mavic4ProDLog,
     /// DJI drone footage with standard profile
     DjiStandard,
     /// GoPro action camera footage
@@ -36,8 +36,8 @@ impl Preset {
     /// Apply preset to a video processor
     pub fn apply(&self, processor: VideoProcessor) -> VideoProcessor {
         match self {
-            Preset::DjiDLog => {
-                // DJI D-Log footage processing with vibrance instead of saturation
+            Preset::Mavic4ProDLog => {
+                // DJI Mavic 4 Pro D-Log footage processing with vibrance instead of saturation
                 processor
                     .profile(ColorProfile::DLog)
                     .contrast(1.15)
@@ -181,7 +181,9 @@ impl Preset {
     /// Get preset from string name
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_lowercase().as_str() {
-            "dji-dlog" | "dji_dlog" => Some(Preset::DjiDLog),
+            "mavic4pro-dlog" | "mavic4pro_dlog" | "mavic-4-pro-dlog" | "mavic4-pro-dlog" => {
+                Some(Preset::Mavic4ProDLog)
+            }
             "dji" | "dji-standard" => Some(Preset::DjiStandard),
             "gopro" => Some(Preset::GoPro),
             "sony-slog" | "slog" => Some(Preset::SonySLog),
@@ -202,7 +204,7 @@ impl Preset {
     /// Get description of the preset
     pub fn description(&self) -> &str {
         match self {
-            Preset::DjiDLog => "DJI drone footage with D-Log color profile",
+            Preset::Mavic4ProDLog => "DJI Mavic 4 Pro footage with D-Log color profile",
             Preset::DjiStandard => "DJI drone footage with standard color profile",
             Preset::GoPro => "GoPro action camera footage",
             Preset::SonySLog => "Sony camera footage with S-Log profile",
@@ -222,7 +224,10 @@ impl Preset {
     /// List all available presets
     pub fn list_all() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("dji-dlog", "DJI drone footage with D-Log color profile"),
+            (
+                "mavic4pro-dlog",
+                "DJI Mavic 4 Pro footage with D-Log color profile",
+            ),
             ("dji", "DJI drone footage with standard color profile"),
             ("gopro", "GoPro action camera footage"),
             ("sony-slog", "Sony camera footage with S-Log profile"),
@@ -237,5 +242,41 @@ impl Preset {
             ("cinematic", "Cinematic teal and orange look"),
             ("portrait", "Portrait mode with skin tone protection"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_name_resolves_mavic4pro_dlog_aliases() {
+        for alias in [
+            "mavic4pro-dlog",
+            "mavic4pro_dlog",
+            "mavic-4-pro-dlog",
+            "MAVIC4PRO-DLOG",
+        ] {
+            assert!(
+                matches!(Preset::from_name(alias), Some(Preset::Mavic4ProDLog)),
+                "alias {alias} should resolve to Mavic4ProDLog"
+            );
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_old_and_unknown_names() {
+        // The preset was renamed away from "dji-dlog".
+        assert!(Preset::from_name("dji-dlog").is_none());
+        assert!(Preset::from_name("not-a-preset").is_none());
+    }
+
+    #[test]
+    fn list_all_advertises_mavic4pro_dlog() {
+        assert!(
+            Preset::list_all()
+                .iter()
+                .any(|(name, _)| *name == "mavic4pro-dlog")
+        );
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use clap::Parser;
-use std::path::PathBuf;
+use clap::{CommandFactory, FromArgMatches, Parser};
+use std::path::{Path, PathBuf};
 
 use speedy_core::{ColorProfile, Preset, VideoProcessor, check_ffmpeg};
 
@@ -11,9 +11,10 @@ use speedy_core::{ColorProfile, Preset, VideoProcessor, check_ffmpeg};
 )]
 #[command(version)]
 struct Args {
-    /// Input video file path
-    #[arg(short, long, required_unless_present = "list_presets")]
-    input: Option<PathBuf>,
+    /// Input video file(s) or a directory. Pass several to stitch them together
+    /// in order; a directory is expanded to its video files sorted by name.
+    #[arg(short, long, required_unless_present = "list_presets", num_args = 1..)]
+    input: Vec<PathBuf>,
 
     /// Output video file path
     #[arg(short, long, required_unless_present = "list_presets")]
@@ -115,7 +116,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
 
     // Initialize logging
     if args.verbose {
@@ -131,7 +133,7 @@ fn main() -> Result<()> {
         for (name, description) in Preset::list_all() {
             println!("{:<15} - {}", name, description);
         }
-        println!("\nUsage: speedy -i input.mp4 -o output.mp4 --preset dji-dlog");
+        println!("\nUsage: speedy -i input.mp4 -o output.mp4 --preset mavic4pro-dlog");
         return Ok(());
     }
 
@@ -154,18 +156,20 @@ fn main() -> Result<()> {
         }
     }
 
-    // Get input and output paths (they must exist if we get here)
-    let input = args
-        .input
-        .ok_or_else(|| anyhow::anyhow!("Input file required"))?;
+    // Resolve inputs: expand any directories into sorted video files.
+    let inputs = resolve_inputs(&args.input)?;
+    if inputs.is_empty() {
+        anyhow::bail!("No input video files found");
+    }
+    for file in &inputs {
+        if !file.exists() {
+            anyhow::bail!("Input file does not exist: {:?}", file);
+        }
+    }
+
     let output = args
         .output
         .ok_or_else(|| anyhow::anyhow!("Output file required"))?;
-
-    // Validate input file
-    if !input.exists() {
-        anyhow::bail!("Input file does not exist: {:?}", input);
-    }
 
     // Create output directory if it doesn't exist
     if let Some(parent) = output.parent() {
@@ -173,13 +177,18 @@ fn main() -> Result<()> {
     }
 
     log::info!("Starting video processing...");
-    log::info!("Input: {:?}", input);
+    if inputs.len() == 1 {
+        log::info!("Input: {:?}", inputs[0]);
+    } else {
+        log::info!("Inputs ({}): {:?}", inputs.len(), inputs);
+    }
     log::info!("Output: {:?}", output);
 
     // Create video processor
-    let mut processor = VideoProcessor::new(&input, &output);
+    let mut processor = VideoProcessor::new_multi(inputs, &output);
 
     // Apply preset if specified
+    let preset_used = args.preset.is_some();
     if let Some(preset_name) = &args.preset {
         if let Some(preset) = Preset::from_name(preset_name) {
             log::info!("Applying preset: {}", preset_name);
@@ -192,17 +201,41 @@ fn main() -> Result<()> {
         }
     }
 
-    // Apply individual settings (these override preset values)
-    processor = processor
-        .speed(args.speed)
-        .codec(&args.codec)
-        .quality(args.quality)
-        .profile(args.profile)
-        .contrast(args.contrast)
-        .saturation(args.saturation)
-        .hardware_accel(args.hw_accel)
-        .stabilize(args.stabilize)
-        .auto_rotate(!args.no_auto_rotate);
+    // Apply individual settings (these override preset values).
+    // When a preset is used, only apply a setting if the user passed the flag
+    // explicitly on the command line, so preset values are not clobbered by
+    // the clap default values.
+    let explicit =
+        |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    if !preset_used || explicit("speed") {
+        processor = processor.speed(args.speed);
+    }
+    if !preset_used || explicit("codec") {
+        processor = processor.codec(&args.codec);
+    }
+    if !preset_used || explicit("quality") {
+        processor = processor.quality(args.quality);
+    }
+    if !preset_used || explicit("profile") {
+        processor = processor.profile(args.profile);
+    }
+    if !preset_used || explicit("contrast") {
+        processor = processor.contrast(args.contrast);
+    }
+    if !preset_used || explicit("saturation") {
+        processor = processor.saturation(args.saturation);
+    }
+    // Boolean toggles are gated the same way, so a preset that turns them on
+    // (e.g. stabilization) is not silently reset by the flag defaults.
+    if !preset_used || explicit("hw_accel") {
+        processor = processor.hardware_accel(args.hw_accel);
+    }
+    if !preset_used || explicit("stabilize") {
+        processor = processor.stabilize(args.stabilize);
+    }
+    if !preset_used || explicit("no_auto_rotate") {
+        processor = processor.auto_rotate(!args.no_auto_rotate);
+    }
 
     // Apply optional settings
     if let Some(bitrate) = args.bitrate {
@@ -256,4 +289,89 @@ fn main() -> Result<()> {
     println!("📁 Output saved to: {:?}", output);
 
     Ok(())
+}
+
+/// Expand the given paths into an ordered list of input files. Directories are
+/// replaced by their video files sorted by name; regular paths are kept as-is.
+fn resolve_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut dir_files: Vec<PathBuf> = std::fs::read_dir(path)
+                .with_context(|| format!("Failed to read directory: {}", path.display()))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| is_video_file(p))
+                .collect();
+            dir_files.sort();
+            if dir_files.is_empty() {
+                anyhow::bail!("No video files found in directory: {}", path.display());
+            }
+            log::info!(
+                "Found {} video file(s) in {}",
+                dir_files.len(),
+                path.display()
+            );
+            files.extend(dir_files);
+        } else {
+            files.push(path.clone());
+        }
+    }
+    Ok(files)
+}
+
+/// Whether a path looks like a video file based on its extension.
+fn is_video_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_video_file_matches_extensions_case_insensitively() {
+        for name in ["a.mp4", "a.MP4", "b.mov", "c.MKV", "d.webm"] {
+            assert!(is_video_file(Path::new(name)), "{name} should be a video");
+        }
+        for name in ["telemetry.srt", "proxy.LRF", "notes.txt", "noext"] {
+            assert!(
+                !is_video_file(Path::new(name)),
+                "{name} should not be a video"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_inputs_passes_through_explicit_files_in_order() -> Result<()> {
+        let inputs = vec![PathBuf::from("b.mp4"), PathBuf::from("a.mov")];
+        // Explicit (non-directory) paths are kept as given, in order.
+        assert_eq!(resolve_inputs(&inputs)?, inputs);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_inputs_expands_directory_sorted_video_only() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("speedy_resolve_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        for name in ["clip_b.mp4", "clip_a.mp4", "telemetry.srt", "proxy.LRF"] {
+            std::fs::write(dir.join(name), b"")?;
+        }
+
+        let resolved = resolve_inputs(std::slice::from_ref(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<String> = resolved?
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        // Non-video files excluded; videos returned sorted by name.
+        assert_eq!(names, vec!["clip_a.mp4", "clip_b.mp4"]);
+        Ok(())
+    }
 }
