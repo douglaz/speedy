@@ -12,6 +12,7 @@ This project is organized as a Rust workspace with two main crates:
 ## Features
 
 - **Speed Adjustment**: Speed up or slow down videos with automatic audio pitch correction
+- **Clip Stitching**: Combine multiple clips (or a whole folder) into one output, normalizing differing resolutions/orientations to a common frame
 - **Color Grading**: Apply LUTs (Look-Up Tables) for professional color grading
 - **Advanced Color Enhancement**:
   - Vibrance (intelligent saturation that protects skin tones)
@@ -53,8 +54,26 @@ speedy -i input.mp4 -o output.mp4 --speed 2.0
 # Apply a LUT file
 speedy -i input.mp4 -o output.mp4 --lut color_grade.cube
 
-# Use a preset for DJI D-Log footage
-speedy -i drone_footage.mp4 -o processed.mp4 --preset dji-dlog
+# Use a preset for DJI Mavic 4 Pro D-Log footage
+speedy -i drone_footage.mp4 -o processed.mp4 --preset mavic4pro-dlog
+```
+
+### Stitching Multiple Clips
+
+Pass several inputs (or a directory) to stitch them into a single output, in
+order. Clips of different resolution or orientation are normalized to a common
+frame (scaled to fit and padded), so mixed 4K/6K and portrait/landscape footage
+can be combined. Any color grading is applied once over the joined timeline.
+
+> Note: stitched output is currently video-only — audio tracks are not
+> concatenated.
+
+```bash
+# Stitch specific clips, in the given order
+speedy -i clip1.mp4 clip2.mp4 clip3.mp4 -o combined.mp4
+
+# Stitch every video in a folder (sorted by filename) and grade from D-Log
+speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 ```
 
 ### Advanced Color Grading
@@ -72,7 +91,7 @@ speedy -i input.mp4 -o output.mp4 --color-balance "0.1:-0.1:0,0:0:0,-0.1:0:0.1"
 
 ### Available Presets
 
-- `dji-dlog`: DJI drone footage with D-Log profile
+- `mavic4pro-dlog`: DJI Mavic 4 Pro footage with D-Log profile
 - `dji`: DJI drone standard footage
 - `gopro`: GoPro action camera
 - `sony-slog`: Sony S-Log footage
