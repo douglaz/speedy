@@ -23,9 +23,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-      
       # Only cache cargo registry (dependencies), not target directory
       # Target caching conflicts with nix environment and multiple build targets
       - name: Cache Cargo registry
@@ -61,9 +58,6 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
-      
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -154,9 +148,6 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
-      
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Install cargo-audit
         run: nix develop -c cargo install cargo-audit

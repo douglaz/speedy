@@ -29,9 +29,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-      
       - name: Build x86_64 Linux (musl - static)
         run: |
           nix build
