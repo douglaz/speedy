@@ -29,7 +29,7 @@ jobs:
       # Only cache cargo registry (dependencies), not target directory
       # Target caching conflicts with nix environment and multiple build targets
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -66,7 +66,7 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@main
       
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -118,7 +118,7 @@ jobs:
           echo "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
       
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
