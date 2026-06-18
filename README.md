@@ -1,47 +1,103 @@
-# Speedy - Video Processing Tool
+# Speedy — Video Processing Tool
 
-A powerful command-line video processing tool built with Rust and FFmpeg, designed for speed adjustment, color grading, and advanced video enhancement.
+A fast command-line video processing tool built in Rust on top of the FFmpeg
+CLI. Speedy handles speed changes, multi-clip stitching, LUT-based color
+grading, log-profile conversion, and a full set of color-enhancement filters —
+all driven by a single `speedy` binary.
 
 ## Project Structure
 
-This project is organized as a Rust workspace with two main crates:
+This project is a Rust workspace with two crates:
 
-- **`speedy-core`**: The core library containing all video processing logic, FFmpeg integration, and color manipulation algorithms
-- **`speedy-cli`**: The command-line interface that provides user-friendly access to the core functionality
+- **`speedy-core`** — the core library: an FFmpeg command builder, the video
+  processing pipeline, color/log-profile handling, and the built-in presets.
+- **`speedy-cli`** — the command-line interface (`speedy` binary) that parses
+  arguments and drives `speedy-core`.
 
 ## Features
 
-- **Speed Adjustment**: Speed up or slow down videos with automatic audio pitch correction
-- **Clip Stitching**: Combine multiple clips (or a whole folder) into one output, normalizing differing resolutions/orientations to a common frame
-- **Color Grading**: Apply LUTs (Look-Up Tables) for professional color grading
-- **Advanced Color Enhancement**:
+- **Speed adjustment** — speed up or slow down footage. Audio is retimed with
+  pitch correction (`atempo`), automatically chaining filters for speeds beyond
+  the 0.5×–2.0× range. Speed changes on video-only clips skip the audio path.
+- **Multi-clip stitching** — pass several inputs (or a directory) to concatenate
+  them into one output, in order. Clips of differing resolution or orientation
+  are normalized to a common frame (scaled to fit and padded), so mixed 4K/6K
+  and portrait/landscape footage can be combined. Any color grading is applied
+  once over the joined timeline.
+- **LUT color grading** — apply a `.cube` 3D LUT with `--lut`.
+- **Log-profile support** — declare the source profile (`--profile`) for D-Log,
+  S-Log, C-Log, V-Log, or F-Log footage. When a matching conversion LUT is
+  present under `luts/`, it is applied automatically; if it's missing the
+  conversion is skipped with a warning so other adjustments still run.
+- **Color enhancement filters**:
+  - Contrast and saturation
   - Vibrance (intelligent saturation that protects skin tones)
-  - Color curves
-  - Color balance (shadows, midtones, highlights)
+  - Color curves (presets or custom curve definitions)
+  - Color balance across shadows, midtones, and highlights
   - Selective color adjustments
   - Hue shifting
-- **Log Profile Support**: Built-in support for D-Log, S-Log, C-Log, V-Log, and F-Log profiles
-- **Smart Presets**: Pre-configured settings for common workflows (DJI drones, GoPro, social media, etc.)
-- **Hardware Acceleration**: Optional hardware acceleration support
-- **Video Stabilization**: Built-in video stabilization
-- **Denoising and Sharpening**: Advanced video enhancement filters
+- **Enhancement & cleanup** — video stabilization (`deshake`), denoising
+  (`nlmeans`), and sharpening (`unsharp`).
+- **Encoding control** — codec (H.264, H.265/HEVC, VP9, AV1, ProRes), CRF
+  quality, target bitrate, thread count, and output scaling.
+- **Hardware acceleration** — optional, using the best method per platform
+  (VAAPI on Linux, VideoToolbox on macOS, DXVA2 on Windows).
+- **Auto-rotation** — honors rotation metadata by default; disable with
+  `--no-auto-rotate`.
+- **Smart presets** — ready-made settings for common cameras and platforms.
+- **Progress reporting** — a live progress bar while FFmpeg runs.
+
+> Note: stitched output is currently video-only — audio tracks from the input
+> clips are not concatenated (a warning is logged when audio is present).
 
 ## Installation
 
 ### Prerequisites
 
-- Rust 1.75 or later
-- FFmpeg 4.0 or later
+- **Rust** 1.88 or later (the workspace uses the 2024 edition and let-chains)
+- **FFmpeg** with `ffmpeg` and `ffprobe` on your `PATH`. Use a build that
+  includes the encoders for the codecs you intend to use (x264, x265, libvpx,
+  libaom, ProRes). FFmpeg 4.3+ covers all the filters used here; FFmpeg 7 is
+  what the Nix dev shell ships.
+
+Install FFmpeg:
+
+```bash
+# Ubuntu/Debian
+sudo apt install ffmpeg
+# macOS
+brew install ffmpeg
+# Windows: https://ffmpeg.org/download.html
+```
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/yourusername/speedy.git
+git clone https://github.com/douglaz/speedy.git
 cd speedy
 cargo build --release
 ```
 
-The binary will be available at `target/release/speedy`.
+The binary is produced at `target/release/speedy`.
+
+### Building with Nix
+
+The repository ships a Nix flake that builds a statically linked (musl) binary
+and provides a development shell with FFmpeg and tooling preinstalled:
+
+```bash
+# Build the static binary (result/bin/speedy)
+nix build
+
+# Run it directly
+nix run . -- -i input.mp4 -o output.mp4 --speed 2.0
+
+# Enter the dev shell (FFmpeg, Rust toolchain, git hooks, etc.)
+nix develop
+```
+
+When using Nix for development, prefix cargo commands with `nix develop -c` so
+the FFmpeg environment is available, e.g. `nix develop -c cargo test`.
 
 ## Usage
 
@@ -56,17 +112,17 @@ speedy -i input.mp4 -o output.mp4 --lut color_grade.cube
 
 # Use a preset for DJI Mavic 4 Pro D-Log footage
 speedy -i drone_footage.mp4 -o processed.mp4 --preset mavic4pro-dlog
+
+# Treat the source as S-Log footage (applies the S-Log LUT if available)
+speedy -i clip.mov -o graded.mp4 --profile s-log
 ```
 
 ### Stitching Multiple Clips
 
 Pass several inputs (or a directory) to stitch them into a single output, in
-order. Clips of different resolution or orientation are normalized to a common
-frame (scaled to fit and padded), so mixed 4K/6K and portrait/landscape footage
-can be combined. Any color grading is applied once over the joined timeline.
-
-> Note: stitched output is currently video-only — audio tracks are not
-> concatenated.
+order. A directory is expanded to its video files (`.mp4`, `.mov`, `.m4v`,
+`.mkv`, `.avi`, `.webm`) sorted by filename. Clips of different resolution or
+orientation are normalized to a common frame.
 
 ```bash
 # Stitch specific clips, in the given order
@@ -79,36 +135,93 @@ speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 ### Advanced Color Grading
 
 ```bash
-# Apply vibrance and curves
+# Vibrance plus a lighter curve
 speedy -i input.mp4 -o output.mp4 --vibrance 0.5 --curves "preset=lighter"
 
 # Cinematic teal and orange look
 speedy -i input.mp4 -o output.mp4 --preset cinematic
 
-# Custom color balance
+# Custom color balance (shadows,midtones,highlights as r:g:b, each -1..1)
 speedy -i input.mp4 -o output.mp4 --color-balance "0.1:-0.1:0,0:0:0,-0.1:0:0.1"
+
+# Hue shift and selective color
+speedy -i input.mp4 -o output.mp4 --hue-shift 10 \
+  --selective-color "reds=0.1:0:-0.1:0,blues=-0.1:0:0.1:0"
 ```
+
+### Enhancement, Scaling, and Encoding
+
+```bash
+# Stabilize, denoise, and sharpen
+speedy -i shaky.mp4 -o clean.mp4 --stabilize --denoise 4 --sharpen 0.6
+
+# Downscale to 1080p (keep aspect ratio with -1 height)
+speedy -i input.mp4 -o output.mp4 --scale "1920:-1"
+
+# Encode H.265 at a higher quality (lower CRF) with hardware acceleration
+speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
+```
+
+### Options Reference
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `-i, --input <PATH>...` | Input file(s) or a directory (multiple = stitch) | — |
+| `-o, --output <PATH>` | Output video file | — |
+| `--preset <NAME>` | Apply a preset (see below) | — |
+| `-s, --speed <X>` | Speed multiplier (e.g. `2.0`) | `1.0` |
+| `-l, --lut <FILE>` | `.cube` LUT for color grading | — |
+| `-p, --profile <PROFILE>` | Source profile: `standard`, `d-log`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
+| `-c, --contrast <V>` | Contrast (0.0–2.0) | `1.0` |
+| `-S, --saturation <V>` | Saturation (0.0–2.0) | `1.0` |
+| `--codec <CODEC>` | `h264`, `h265`/`hevc`, `vp9`, `av1`, `prores` | `h264` |
+| `-b, --bitrate <MBPS>` | Target video bitrate in Mbps | — |
+| `-q, --quality <CRF>` | CRF quality (0–51, lower is better) | `23` |
+| `--hw-accel` | Enable hardware acceleration if available | off |
+| `-t, --threads <N>` | Number of encoding threads | auto |
+| `--stabilize` | Enable video stabilization | off |
+| `--no-auto-rotate` | Disable auto-rotation from metadata | off |
+| `--denoise <1-10>` | Denoising strength | — |
+| `--sharpen <0.1-2.0>` | Sharpening strength | — |
+| `--vibrance <-2.0..2.0>` | Vibrance (protects skin tones) | — |
+| `--curves <SPEC>` | Color curves, e.g. `preset=lighter` | — |
+| `--hue-shift <-180..180>` | Hue shift in degrees | — |
+| `--color-balance <SPEC>` | `shadows,midtones,highlights` as `r:g:b` | — |
+| `--selective-color <SPEC>` | Per-color-range adjustments | — |
+| `--scale <SPEC>` | Resolution, e.g. `1920x1080` or `1920:-1` | — |
+| `--list-presets` | List available presets and exit | — |
+| `-v, --verbose` | Verbose (debug) logging | off |
+
+When a preset is used, explicitly passed flags override the preset's values,
+while flags left at their defaults do not clobber what the preset sets.
+
+Run `speedy --help` for the authoritative, always-current list.
 
 ### Available Presets
 
-- `mavic4pro-dlog`: DJI Mavic 4 Pro footage with D-Log profile
-- `dji`: DJI drone standard footage
-- `gopro`: GoPro action camera
-- `sony-slog`: Sony S-Log footage
-- `canon-clog`: Canon C-Log footage
-- `instagram`: Optimized for Instagram
-- `youtube`: Optimized for YouTube
-- `tiktok`: Optimized for TikTok
-- `cinema4k`: Cinema 4K ProRes export
-- `natural`: Natural color enhancement
-- `cinematic`: Teal and orange cinematic look
-- `portrait`: Portrait mode with skin tone protection
+List them at any time with `speedy --list-presets`.
 
-List all presets with: `speedy --list-presets`
+| Preset | Aliases | Description |
+| --- | --- | --- |
+| `mavic4pro-dlog` | `mavic4pro_dlog`, `mavic-4-pro-dlog` | DJI Mavic 4 Pro footage with D-Log profile |
+| `dji` | `dji-standard` | DJI drone footage, standard profile |
+| `gopro` | | GoPro action camera footage |
+| `sony-slog` | `slog` | Sony footage with S-Log profile |
+| `canon-clog` | `clog` | Canon footage with C-Log profile |
+| `instagram` | `ig` | Optimized for Instagram |
+| `youtube` | `yt` | Optimized for YouTube |
+| `tiktok` | `tt` | Optimized for TikTok |
+| `cinema4k` | `cinema`, `4k` | Cinema 4K export (ProRes, maximum quality) |
+| `preview` | `fast` | Fast preview (lower quality, faster) |
+| `archive` | `archival` | High-quality archival (H.265, low CRF) |
+| `natural` | `natural-enhance` | Natural color enhancement using vibrance |
+| `cinematic` | `teal-orange` | Cinematic teal and orange look |
+| `portrait` | | Portrait mode with skin-tone protection |
 
 ## Development
 
-This project uses Git hooks for maintaining code quality. When you enter the development environment, hooks are automatically configured:
+This project uses Git hooks for code quality. When you enter the Nix dev shell
+the hooks are configured automatically:
 
 ```bash
 $ nix develop
@@ -120,18 +233,16 @@ $ nix develop
 
 ### Git Hooks
 
-The project includes two Git hooks that help maintain code quality:
+1. **pre-commit** — ensures code is formatted (`cargo fmt --check`).
+2. **pre-push** — runs formatting and `cargo clippy --workspace -- -D warnings`.
 
-1. **pre-commit**: Ensures code is properly formatted before committing
-2. **pre-push**: Runs both formatting and clippy checks before pushing
-
-These hooks are automatically configured when you enter the nix development shell. To manually configure them:
+To configure them manually:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-To disable the hooks temporarily:
+To disable them temporarily:
 
 ```bash
 git config --unset core.hooksPath
@@ -139,37 +250,35 @@ git config --unset core.hooksPath
 
 ### Running Checks Manually
 
-You can run the quality checks manually at any time:
-
 ```bash
-# Check formatting
-nix develop -c cargo fmt --check
+# Tests
+nix develop -c cargo test
 
-# Fix formatting
-nix develop -c cargo fmt
+# Formatting
+nix develop -c cargo fmt --check   # check
+nix develop -c cargo fmt           # fix
 
-# Run clippy
+# Clippy
 nix develop -c cargo clippy --workspace -- -D warnings
 
-# Run all checks
+# Everything
 nix develop -c cargo fmt --check && nix develop -c cargo clippy --workspace -- -D warnings
 ```
 
-### Workspace Structure
+### Workspace Layout
 
 ```
 speedy/
-├── Cargo.toml           # Workspace configuration
-├── speedy-core/         # Core library
+├── Cargo.toml            # Workspace configuration
+├── flake.nix             # Nix flake (static build + dev shell)
+├── speedy-core/          # Core library
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs
-│       ├── ffmpeg_wrapper.rs
-│       ├── video_processor.rs
-│       ├── presets.rs
-│       ├── color_enhance.rs
-│       └── lut.rs
-└── speedy-cli/          # CLI application
+│       ├── lib.rs            # Public API, ColorProfile
+│       ├── ffmpeg_wrapper.rs # FFmpeg command builder + ffprobe
+│       ├── video_processor.rs# Processing pipeline / stitching
+│       └── presets.rs        # Built-in presets
+└── speedy-cli/           # CLI application (`speedy` binary)
     ├── Cargo.toml
     └── src/
         └── main.rs
@@ -181,37 +290,41 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-speedy-core = { git = "https://github.com/yourusername/speedy.git" }
+speedy-core = { git = "https://github.com/douglaz/speedy.git" }
 ```
 
 Example usage:
 
 ```rust
-use speedy_core::{VideoProcessor, ColorProfile, Preset};
+use speedy_core::{ColorProfile, VideoProcessor};
 
 fn main() -> anyhow::Result<()> {
-    let mut processor = VideoProcessor::new("input.mp4", "output.mp4");
-    
-    processor = processor
+    let processor = VideoProcessor::new("input.mp4", "output.mp4")
         .speed(2.0)
         .profile(ColorProfile::DLog)
         .vibrance(0.5)
         .quality(20);
-    
+
     processor.process()?;
     Ok(())
 }
 ```
 
+To stitch multiple clips, build the processor with `VideoProcessor::new_multi`:
+
+```rust
+use std::path::PathBuf;
+use speedy_core::VideoProcessor;
+
+let clips = vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")];
+VideoProcessor::new_multi(clips, "combined.mp4").process()?;
+```
+
 ## License
 
-This project is licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under either of MIT or Apache-2.0, at your option (see the `license`
+field in `Cargo.toml`).
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome — please feel free to open an issue or a pull request.
