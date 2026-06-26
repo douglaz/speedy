@@ -139,13 +139,29 @@ impl FFmpegCommand {
         self
     }
 
-    /// Set video speed (affects both video and audio)
-    /// If has_audio is false, only video speed is adjusted
-    pub fn speed(mut self, multiplier: f64, has_audio: bool) -> Self {
+    /// Set video speed (affects both video and audio).
+    ///
+    /// `setpts` only rescales timestamps, so a speed-up on its own keeps every
+    /// source frame and inflates the frame rate (a 10x speed-up of 30fps would
+    /// emit a ~300fps file with all frames re-encoded). When `output_fps` is
+    /// given, a trailing `fps` filter resamples the retimed stream back to that
+    /// rate: a speed-up then drops frames (a shorter clip at a normal fps) and a
+    /// slow-down duplicates them. Pass `None` to keep the raw retimed stream.
+    ///
+    /// If `has_audio` is false, only video speed is adjusted.
+    pub fn speed(mut self, multiplier: f64, has_audio: bool, output_fps: Option<&str>) -> Self {
         if multiplier != 1.0 {
             // Video speed adjustment
             self.video_filters
                 .push(format!("setpts={:.4}*PTS", 1.0 / multiplier));
+
+            // Resample the retimed stream to a sane frame rate so the output fps
+            // does not scale with the speed multiplier. Placed right after
+            // setpts so any later per-frame filters (e.g. a LUT) only process
+            // the frames that survive decimation.
+            if let Some(fps) = output_fps {
+                self.video_filters.push(format!("fps={fps}"));
+            }
 
             // Audio speed adjustment (with pitch correction) - only if audio exists
             if has_audio {
@@ -768,6 +784,70 @@ mod tests {
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert!(fc.ends_with("format=yuv422p10le[v]"), "fc: {fc}");
+        Ok(())
+    }
+
+    #[test]
+    fn speed_up_with_output_fps_decimates_frames() -> Result<()> {
+        // A 10x speed-up must retime via setpts AND resample to the target fps;
+        // without the fps filter the output keeps every source frame at ~10x the
+        // frame rate instead of becoming a shorter clip.
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(10.0, false, Some("30"))
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert_eq!(fc, "[0:v]setpts=0.1000*PTS,fps=30,format=yuv420p[v]");
+        Ok(())
+    }
+
+    #[test]
+    fn speed_change_without_output_fps_keeps_raw_retimed_stream() -> Result<()> {
+        // Back-compat: with no target fps only setpts is applied (no decimation).
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(2.0, false, None)
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert_eq!(fc, "[0:v]setpts=0.5000*PTS,format=yuv420p[v]");
+        Ok(())
+    }
+
+    #[test]
+    fn speed_resample_runs_before_a_lut() -> Result<()> {
+        // The fps decimation must precede the LUT so the LUT only grades the
+        // frames that survive the speed-up.
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(10.0, false, Some("30"))
+                .lut3d("grade.cube")
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert_eq!(
+            fc,
+            "[0:v]setpts=0.1000*PTS,fps=30,lut3d=grade.cube,format=yuv420p[v]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn speed_up_retimes_audio_independently_of_video_fps() -> Result<()> {
+        // Video gets setpts + fps; audio is pitch-corrected with chained atempo
+        // (4x = 2.0 * 2.0) and is unaffected by the video frame-rate target.
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(4.0, true, Some("30"))
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(
+            fc.contains("[0:v]setpts=0.2500*PTS,fps=30,format=yuv420p[v]"),
+            "fc: {fc}"
+        );
+        assert!(fc.contains("[0:a]atempo=2.0,atempo=2.0000[a]"), "fc: {fc}");
         Ok(())
     }
 

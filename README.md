@@ -16,9 +16,13 @@ This project is a Rust workspace with two crates:
 
 ## Features
 
-- **Speed adjustment** — speed up or slow down footage. Audio is retimed with
-  pitch correction (`atempo`), automatically chaining filters for speeds beyond
-  the 0.5×–2.0× range. Speed changes on video-only clips skip the audio path.
+- **Speed adjustment** — speed up or slow down footage. The retimed stream is
+  resampled back to a sane frame rate (the source fps by default, or `--output-fps`),
+  so a speed-up drops frames into a shorter clip instead of inflating the frame
+  rate — a 10× speed-up of 30 fps footage stays 30 fps rather than becoming
+  ~300 fps with every source frame re-encoded. Audio is retimed with pitch
+  correction (`atempo`), automatically chaining filters for speeds beyond the
+  0.5×–2.0× range. Speed changes on video-only clips skip the audio path.
 - **Multi-clip stitching** — pass several inputs (or a directory) to concatenate
   them into one output, in order. Clips of differing resolution or orientation
   are normalized to a common frame (scaled to fit and padded), so mixed 4K/6K
@@ -130,6 +134,13 @@ speedy -i clip1.mp4 clip2.mp4 clip3.mp4 -o combined.mp4
 
 # Stitch every video in a folder (sorted by filename) and grade from D-Log
 speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
+
+# Stitch a folder of DJI D-Log clips into a 10× hyperlapse with the D-Log LUT.
+# The speed-up decimates frames back to the source fps, so the output is a
+# short, normal-frame-rate clip (not a ~300 fps file).
+speedy -i /path/to/DCIM/DJI_001 \
+  --lut "luts/mavic4_pro_dlog_to_rec709.cube" \
+  --speed 10 --codec h265 -o combined_10x.mp4
 ```
 
 ### Advanced Color Grading
@@ -170,6 +181,7 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `-o, --output <PATH>` | Output video file | — |
 | `--preset <NAME>` | Apply a preset (see below) | — |
 | `-s, --speed <X>` | Speed multiplier (e.g. `2.0`) | `1.0` |
+| `--output-fps <FPS>` | Output frame rate for speed changes (e.g. `30`, `30000/1001`) | source fps |
 | `-l, --lut <FILE>` | `.cube` LUT for color grading | — |
 | `-p, --profile <PROFILE>` | Source profile: `standard`, `d-log`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
 | `-c, --contrast <V>` | Contrast (0.0–2.0) | `1.0` |

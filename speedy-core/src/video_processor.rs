@@ -33,6 +33,10 @@ pub struct VideoProcessor {
     hue_shift: Option<f32>,
     color_balance: Option<ColorBalanceValues>,
     selective_color: Option<String>,
+    /// Target output frame rate used when the speed is changed. `None` defaults
+    /// to the source frame rate, which makes a speed-up drop frames instead of
+    /// inflating the frame rate.
+    output_fps: Option<String>,
 }
 
 impl VideoProcessor {
@@ -66,11 +70,20 @@ impl VideoProcessor {
             hue_shift: None,
             color_balance: None,
             selective_color: None,
+            output_fps: None,
         }
     }
 
     pub fn speed(mut self, multiplier: f64) -> Self {
         self.speed_multiplier = multiplier;
+        self
+    }
+
+    /// Set the target output frame rate used when the speed is changed (e.g.
+    /// `"30"` or `"30000/1001"`). Defaults to the source frame rate, so a
+    /// speed-up drops frames rather than producing a higher-fps file.
+    pub fn output_fps(mut self, fps: &str) -> Self {
+        self.output_fps = Some(fps.to_string());
         self
     }
 
@@ -329,9 +342,25 @@ impl VideoProcessor {
             }
         }
 
-        // Apply speed adjustment
+        // Apply speed adjustment. Resample to a target frame rate (the source
+        // fps unless overridden) so a speed-up yields a shorter clip at a normal
+        // frame rate instead of re-encoding every source frame at a multiplied
+        // fps. A degenerate/unknown source fps falls back to no resampling.
         if self.speed_multiplier != 1.0 {
-            cmd = cmd.speed(self.speed_multiplier, info.has_audio);
+            let target_fps = match &self.output_fps {
+                Some(fps) => Some(fps.clone()),
+                None => {
+                    let probed = probe_video_fps(&self.inputs[0], info.fps);
+                    fps_string_value(&probed).map(|_| probed)
+                }
+            };
+            if let Some(ref fps) = target_fps {
+                log::info!(
+                    "Resampling to {fps} fps after a {speed}x speed change",
+                    speed = self.speed_multiplier
+                );
+            }
+            cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps.as_deref());
         }
 
         // Apply LUT if specified or use profile LUT
@@ -484,6 +513,25 @@ fn probe_video_fps(path: &Path, default: f64) -> String {
     format!("{default:.5}")
 }
 
+/// Parse an ffmpeg frame-rate string (`"30000/1001"` or `"29.97"`) into a
+/// positive float, returning `None` when it is missing, malformed, or
+/// non-positive. Used to reject a degenerate source fps before feeding it to the
+/// `fps` filter (where `fps=0` would be invalid).
+fn fps_string_value(s: &str) -> Option<f64> {
+    if let Some((num, den)) = s.split_once('/') {
+        let num: f64 = num.trim().parse().ok()?;
+        let den: f64 = den.trim().parse().ok()?;
+        if num > 0.0 && den > 0.0 {
+            Some(num / den)
+        } else {
+            None
+        }
+    } else {
+        let value: f64 = s.trim().parse().ok()?;
+        (value > 0.0).then_some(value)
+    }
+}
+
 /// Display dimensions of a clip, accounting for a 90°/270° rotation flag
 /// (cameras often store rotated footage with a rotation tag).
 fn display_dimensions(info: &crate::VideoInfo) -> (u32, u32) {
@@ -532,6 +580,26 @@ mod tests {
         }
         let processor = VideoProcessor::new("in.mp4", "out.mp4").profile(crate::ColorProfile::DLog);
         assert_eq!(processor.get_profile_lut(), None);
+    }
+
+    #[test]
+    fn fps_string_value_parses_rational_and_decimal() {
+        assert_eq!(fps_string_value("30000/1001"), Some(30000.0 / 1001.0));
+        assert_eq!(fps_string_value("30"), Some(30.0));
+        assert_eq!(fps_string_value("60.0"), Some(60.0));
+        // Degenerate or malformed rates are rejected so they never reach `fps=`.
+        assert_eq!(fps_string_value("0/0"), None);
+        assert_eq!(fps_string_value("0"), None);
+        assert_eq!(fps_string_value("abc"), None);
+    }
+
+    #[test]
+    fn output_fps_builder_sets_target() {
+        let processor = VideoProcessor::new("in.mp4", "out.mp4").output_fps("60");
+        assert_eq!(processor.output_fps.as_deref(), Some("60"));
+        // Unset by default, so the source fps is used.
+        let default = VideoProcessor::new("in.mp4", "out.mp4");
+        assert_eq!(default.output_fps, None);
     }
 
     #[test]
