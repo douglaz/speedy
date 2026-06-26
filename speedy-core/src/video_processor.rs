@@ -37,6 +37,8 @@ pub struct VideoProcessor {
     /// to the source frame rate, which makes a speed-up drop frames instead of
     /// inflating the frame rate.
     output_fps: Option<String>,
+    /// Haze-removal strength (~0.5 medium, 1.0 strong). `None` disables it.
+    dehaze: Option<f32>,
 }
 
 impl VideoProcessor {
@@ -71,6 +73,7 @@ impl VideoProcessor {
             color_balance: None,
             selective_color: None,
             output_fps: None,
+            dehaze: None,
         }
     }
 
@@ -84,6 +87,13 @@ impl VideoProcessor {
     /// speed-up drops frames rather than producing a higher-fps file.
     pub fn output_fps(mut self, fps: &str) -> Self {
         self.output_fps = Some(fps.to_string());
+        self
+    }
+
+    /// Enable haze removal at the given strength (~0.5 medium, 1.0 strong).
+    /// Pulls the black point, adds contrast, and restores saturation/vibrance.
+    pub fn dehaze(mut self, strength: f32) -> Self {
+        self.dehaze = Some(strength);
         self
     }
 
@@ -387,6 +397,14 @@ impl VideoProcessor {
             cmd = cmd.lut3d(profile_lut);
         }
 
+        // Apply haze removal (after the LUT, so it grades the Rec.709 image).
+        if let Some(strength) = self.dehaze
+            && strength > 0.0
+        {
+            log::info!("Applying dehaze (strength {strength})");
+            cmd = cmd.dehaze(strength);
+        }
+
         // Apply color adjustments
         if self.contrast != 1.0 || self.saturation != 1.0 {
             cmd = cmd.color_enhance(self.contrast, self.saturation);
@@ -623,6 +641,14 @@ mod tests {
         assert_eq!(fps_string_value("0/0"), None);
         assert_eq!(fps_string_value("0"), None);
         assert_eq!(fps_string_value("abc"), None);
+    }
+
+    #[test]
+    fn dehaze_builder_sets_strength() {
+        let processor = VideoProcessor::new("in.mp4", "out.mp4").dehaze(0.5);
+        assert_eq!(processor.dehaze, Some(0.5));
+        // Off by default.
+        assert_eq!(VideoProcessor::new("in.mp4", "out.mp4").dehaze, None);
     }
 
     #[test]
