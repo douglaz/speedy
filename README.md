@@ -135,12 +135,13 @@ speedy -i clip1.mp4 clip2.mp4 clip3.mp4 -o combined.mp4
 # Stitch every video in a folder (sorted by filename) and grade from D-Log
 speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 
-# Stitch a folder of DJI D-Log clips into a 10× hyperlapse with the D-Log LUT.
-# The speed-up decimates frames back to the source fps, so the output is a
-# short, normal-frame-rate clip (not a ~300 fps file).
+# Stitch a folder of DJI D-Log clips into a 10× hyperlapse. The speed-up
+# decimates frames back to the source fps, so the output is a short,
+# normal-frame-rate clip (not a ~300 fps file). `--profile d-log` auto-applies
+# the bundled D-Log LUT when one is present under luts/ (and is skipped with a
+# warning otherwise); or grade with your own via `--lut /path/to/your.cube`.
 speedy -i /path/to/DCIM/DJI_001 \
-  --lut "luts/mavic4_pro_dlog_to_rec709.cube" \
-  --speed 10 --codec h265 -o combined_10x.mp4
+  --profile d-log --speed 10 --codec h265 -o combined_10x.mp4
 ```
 
 ### Advanced Color Grading
