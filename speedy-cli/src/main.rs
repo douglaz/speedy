@@ -28,6 +28,12 @@ struct Args {
     #[arg(short, long, default_value = "1.0")]
     speed: f64,
 
+    /// Output frame rate for speed changes (e.g. "30" or "30000/1001").
+    /// Defaults to the source frame rate, so a speed-up drops frames instead of
+    /// inflating the frame rate (a 10x speed-up of 30fps stays 30fps).
+    #[arg(long, value_name = "FPS")]
+    output_fps: Option<String>,
+
     /// LUT file path for color grading (supports .cube files)
     #[arg(short, long)]
     lut: Option<PathBuf>,
@@ -280,6 +286,10 @@ fn main() -> Result<()> {
 
     if let Some(scale) = args.scale {
         processor = processor.scale(&scale);
+    }
+
+    if let Some(output_fps) = args.output_fps {
+        processor = processor.output_fps(&output_fps);
     }
 
     // Process the video

@@ -33,6 +33,10 @@ pub struct VideoProcessor {
     hue_shift: Option<f32>,
     color_balance: Option<ColorBalanceValues>,
     selective_color: Option<String>,
+    /// Target output frame rate used when the speed is changed. `None` defaults
+    /// to the source frame rate, which makes a speed-up drop frames instead of
+    /// inflating the frame rate.
+    output_fps: Option<String>,
 }
 
 impl VideoProcessor {
@@ -66,11 +70,20 @@ impl VideoProcessor {
             hue_shift: None,
             color_balance: None,
             selective_color: None,
+            output_fps: None,
         }
     }
 
     pub fn speed(mut self, multiplier: f64) -> Self {
         self.speed_multiplier = multiplier;
+        self
+    }
+
+    /// Set the target output frame rate used when the speed is changed (e.g.
+    /// `"30"` or `"30000/1001"`). Defaults to the source frame rate, so a
+    /// speed-up drops frames rather than producing a higher-fps file.
+    pub fn output_fps(mut self, fps: &str) -> Self {
+        self.output_fps = Some(fps.to_string());
         self
     }
 
@@ -329,9 +342,37 @@ impl VideoProcessor {
             }
         }
 
-        // Apply speed adjustment
+        // Apply speed adjustment. Resample to a target frame rate (the source
+        // fps unless overridden) so a speed-up yields a shorter clip at a normal
+        // frame rate instead of re-encoding every source frame at a multiplied
+        // fps. A degenerate/unknown source fps falls back to no resampling.
         if self.speed_multiplier != 1.0 {
-            cmd = cmd.speed(self.speed_multiplier, info.has_audio);
+            let target_fps = match &self.output_fps {
+                Some(fps) => {
+                    // Validate an explicit override up front so a bad value
+                    // (e.g. `--output-fps 0` or `0/0`) fails fast with a clear
+                    // message instead of as a late, cryptic ffmpeg error.
+                    if fps_string_value(fps).is_none() {
+                        anyhow::bail!(
+                            "Invalid --output-fps {fps:?}; expected a positive number like \"30\" or \"30000/1001\""
+                        );
+                    }
+                    Some(fps.clone())
+                }
+                None => {
+                    // Default to the source's average cadence, which is the
+                    // correct decimation target for variable-frame-rate inputs.
+                    let probed = probe_target_fps(&self.inputs[0], info.fps);
+                    fps_string_value(&probed).map(|_| probed)
+                }
+            };
+            if let Some(ref fps) = target_fps {
+                log::info!(
+                    "Resampling to {fps} fps after a {speed}x speed change",
+                    speed = self.speed_multiplier
+                );
+            }
+            cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps.as_deref());
         }
 
         // Apply LUT if specified or use profile LUT
@@ -452,36 +493,75 @@ impl VideoProcessor {
     }
 }
 
-/// Probe the first *video* stream's frame rate as an ffmpeg-ready string (e.g.
-/// `"30000/1001"`). Falls back to the formatted `default` when the value is
-/// missing or degenerate (e.g. a non-video first stream reporting `0/0`).
+/// Probe the first *video* stream's base frame rate (`r_frame_rate`) as an
+/// ffmpeg-ready string (e.g. `"30000/1001"`). Falls back to the formatted
+/// `default` when the value is missing or degenerate (e.g. a non-video first
+/// stream reporting `0/0`). Used to set a common CFR cadence when stitching.
 fn probe_video_fps(path: &Path, default: f64) -> String {
-    let probed = std::process::Command::new("ffprobe")
+    probe_stream_rate(path, "r_frame_rate").unwrap_or_else(|| format!("{default:.5}"))
+}
+
+/// Probe the decimation target for a speed change: the first video stream's
+/// average cadence (`avg_frame_rate`), falling back to the base `r_frame_rate`
+/// and then the formatted `default`. The average rate is the right target for
+/// variable-frame-rate sources — there `r_frame_rate` is only a timebase guess
+/// and can be far higher than the real cadence, which would otherwise keep too
+/// many frames after a speed-up.
+fn probe_target_fps(path: &Path, default: f64) -> String {
+    probe_stream_rate(path, "avg_frame_rate")
+        .or_else(|| probe_stream_rate(path, "r_frame_rate"))
+        .unwrap_or_else(|| format!("{default:.5}"))
+}
+
+/// Read a single rational rate entry (`r_frame_rate` or `avg_frame_rate`) for
+/// the first video stream, returning it verbatim only when it is a positive
+/// rational (`num > 0 && den > 0`); otherwise `None`.
+fn probe_stream_rate(path: &Path, entry: &str) -> Option<String> {
+    let show_entries = format!("stream={entry}");
+    let rate = std::process::Command::new("ffprobe")
         .args([
             "-v",
             "error",
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=r_frame_rate",
+            show_entries.as_str(),
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(path)
         .output()
         .ok()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())?;
 
-    if let Some(rate) = probed
-        && let Some((num, den)) = rate.split_once('/')
+    if let Some((num, den)) = rate.split_once('/')
         && let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>())
         && num > 0.0
         && den > 0.0
     {
-        return rate;
+        Some(rate)
+    } else {
+        None
     }
+}
 
-    format!("{default:.5}")
+/// Parse an ffmpeg frame-rate string (`"30000/1001"` or `"29.97"`) into a
+/// positive float, returning `None` when it is missing, malformed, or
+/// non-positive. Used to reject a degenerate source fps before feeding it to the
+/// `fps` filter (where `fps=0` would be invalid).
+fn fps_string_value(s: &str) -> Option<f64> {
+    if let Some((num, den)) = s.split_once('/') {
+        let num: f64 = num.trim().parse().ok()?;
+        let den: f64 = den.trim().parse().ok()?;
+        if num > 0.0 && den > 0.0 {
+            Some(num / den)
+        } else {
+            None
+        }
+    } else {
+        let value: f64 = s.trim().parse().ok()?;
+        (value > 0.0).then_some(value)
+    }
 }
 
 /// Display dimensions of a clip, accounting for a 90°/270° rotation flag
@@ -532,6 +612,26 @@ mod tests {
         }
         let processor = VideoProcessor::new("in.mp4", "out.mp4").profile(crate::ColorProfile::DLog);
         assert_eq!(processor.get_profile_lut(), None);
+    }
+
+    #[test]
+    fn fps_string_value_parses_rational_and_decimal() {
+        assert_eq!(fps_string_value("30000/1001"), Some(30000.0 / 1001.0));
+        assert_eq!(fps_string_value("30"), Some(30.0));
+        assert_eq!(fps_string_value("60.0"), Some(60.0));
+        // Degenerate or malformed rates are rejected so they never reach `fps=`.
+        assert_eq!(fps_string_value("0/0"), None);
+        assert_eq!(fps_string_value("0"), None);
+        assert_eq!(fps_string_value("abc"), None);
+    }
+
+    #[test]
+    fn output_fps_builder_sets_target() {
+        let processor = VideoProcessor::new("in.mp4", "out.mp4").output_fps("60");
+        assert_eq!(processor.output_fps.as_deref(), Some("60"));
+        // Unset by default, so the source fps is used.
+        let default = VideoProcessor::new("in.mp4", "out.mp4");
+        assert_eq!(default.output_fps, None);
     }
 
     #[test]
