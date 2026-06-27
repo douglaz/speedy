@@ -299,7 +299,13 @@ impl FFmpegCommand {
     /// makes a non-increasing `curves` point, or vibrance exceeds +/-2), which
     /// FFmpeg rejects.
     pub fn dehaze(mut self, strength: f32) -> Self {
-        let s = strength.clamp(0.0, 1.0);
+        // `clamp` keeps NaN as NaN (and would emit "NaN" into the filtergraph),
+        // so map NaN to 0.0 (no-op) first; clamp then bounds +/-inf to [0, 1].
+        let s = if strength.is_nan() {
+            0.0
+        } else {
+            strength.clamp(0.0, 1.0)
+        };
         let black_point = 0.10 * s;
         let contrast = 1.0 + 0.15 * s;
         let saturation = 1.0 + 0.35 * s;
@@ -911,6 +917,27 @@ mod tests {
         .clone();
         assert_eq!(at_max, over_max);
         assert!(at_max.contains("curves=all='0.100/0 1/1'"), "fc: {at_max}");
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_treats_nan_as_zero() -> Result<()> {
+        // `f32::clamp` preserves NaN, which would emit "NaN" into the filter
+        // graph; NaN must degrade to a no-op (strength 0) instead.
+        let nan = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .dehaze(f32::NAN)
+                .build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        let zero = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(0.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        assert_eq!(nan, zero);
+        assert!(!nan.contains("NaN"), "fc must not contain NaN: {nan}");
         Ok(())
     }
 
