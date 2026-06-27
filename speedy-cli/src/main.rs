@@ -90,8 +90,9 @@ struct Args {
     #[arg(long)]
     vibrance: Option<f32>,
 
-    /// Remove atmospheric haze at the given strength (~0.5 medium, 1.0 strong).
-    /// Pulls the black point, adds contrast, and restores saturation/vibrance.
+    /// Remove atmospheric haze at the given strength (~0.5 medium, 1.0 strong;
+    /// clamped to 0.0-1.0). Pulls the black point, adds contrast, and restores
+    /// saturation/vibrance.
     #[arg(long, value_name = "STRENGTH")]
     dehaze: Option<f32>,
 

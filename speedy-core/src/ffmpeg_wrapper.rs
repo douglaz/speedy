@@ -294,9 +294,12 @@ impl FFmpegCommand {
     /// veil, add contrast/saturation with `eq` (nudging gamma up so the lifted
     /// blacks don't crush the midtones), then restore colour with `vibrance`.
     /// All amounts scale with `strength`, where ~0.5 is a balanced "medium" and
-    /// 1.0 is strong; values are clamped to be non-negative.
+    /// 1.0 is strong. The strength is clamped to `[0.0, 1.0]`: beyond 1.0 the
+    /// derived values would leave their valid ranges (e.g. a black point >= 1.0
+    /// makes a non-increasing `curves` point, or vibrance exceeds +/-2), which
+    /// FFmpeg rejects.
     pub fn dehaze(mut self, strength: f32) -> Self {
-        let s = strength.max(0.0);
+        let s = strength.clamp(0.0, 1.0);
         let black_point = 0.10 * s;
         let contrast = 1.0 + 0.15 * s;
         let saturation = 1.0 + 0.35 * s;
@@ -888,6 +891,26 @@ mod tests {
             fc,
             "[0:v]curves=all='0.050/0 1/1',eq=contrast=1.075:saturation=1.175:gamma=1.030,vibrance=intensity=0.450,format=yuv420p[v]"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_clamps_strength_to_valid_range() -> Result<()> {
+        // Strengths above 1.0 are clamped: otherwise the black point reaches/
+        // exceeds 1.0 (a non-increasing curves point) and vibrance/saturation
+        // leave their valid ranges, which FFmpeg rejects.
+        let at_max = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(1.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        let over_max = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(10.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        assert_eq!(at_max, over_max);
+        assert!(at_max.contains("curves=all='0.100/0 1/1'"), "fc: {at_max}");
         Ok(())
     }
 
