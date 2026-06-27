@@ -90,6 +90,12 @@ struct Args {
     #[arg(long)]
     vibrance: Option<f32>,
 
+    /// Remove atmospheric haze at the given strength (~0.5 medium, 1.0 strong;
+    /// clamped to 0.0-1.0). Pulls the black point, adds contrast, and restores
+    /// saturation/vibrance.
+    #[arg(long, value_name = "STRENGTH")]
+    dehaze: Option<f32>,
+
     /// Apply color curves (e.g., "preset=lighter" or "red='0/0 0.5/0.6 1/1'")
     #[arg(long)]
     curves: Option<String>,
@@ -266,6 +272,10 @@ fn main() -> Result<()> {
 
     if let Some(vibrance) = args.vibrance {
         processor = processor.vibrance(vibrance);
+    }
+
+    if let Some(dehaze) = args.dehaze {
+        processor = processor.dehaze(dehaze);
     }
 
     if let Some(curves) = args.curves {

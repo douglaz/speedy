@@ -286,6 +286,41 @@ impl FFmpegCommand {
         self
     }
 
+    /// Apply a haze-removal grade ("dehaze") of the given strength.
+    ///
+    /// Atmospheric haze lifts the black point and washes out contrast and
+    /// colour. There is no native ffmpeg dehaze filter, so this approximates one
+    /// (DaVinci-style): pull the black point down with `curves` to remove the
+    /// veil, add contrast/saturation with `eq` (nudging gamma up so the lifted
+    /// blacks don't crush the midtones), then restore colour with `vibrance`.
+    /// All amounts scale with `strength`, where ~0.5 is a balanced "medium" and
+    /// 1.0 is strong. The strength is clamped to `[0.0, 1.0]`: beyond 1.0 the
+    /// derived values would leave their valid ranges (e.g. a black point >= 1.0
+    /// makes a non-increasing `curves` point, or vibrance exceeds +/-2), which
+    /// FFmpeg rejects.
+    pub fn dehaze(mut self, strength: f32) -> Self {
+        // `clamp` keeps NaN as NaN (and would emit "NaN" into the filtergraph),
+        // so map NaN to 0.0 (no-op) first; clamp then bounds +/-inf to [0, 1].
+        let s = if strength.is_nan() {
+            0.0
+        } else {
+            strength.clamp(0.0, 1.0)
+        };
+        let black_point = 0.10 * s;
+        let contrast = 1.0 + 0.15 * s;
+        let saturation = 1.0 + 0.35 * s;
+        let gamma = 1.0 + 0.06 * s;
+        let vibrance = 0.9 * s;
+        self.video_filters
+            .push(format!("curves=all='{black_point:.3}/0 1/1'"));
+        self.video_filters.push(format!(
+            "eq=contrast={contrast:.3}:saturation={saturation:.3}:gamma={gamma:.3}"
+        ));
+        self.video_filters
+            .push(format!("vibrance=intensity={vibrance:.3}"));
+        self
+    }
+
     /// Apply color curves
     pub fn curves(mut self, curves_str: &str) -> Self {
         // Curves can be preset names or custom curve definitions
@@ -848,6 +883,79 @@ mod tests {
             "fc: {fc}"
         );
         assert!(fc.contains("[0:a]atempo=2.0,atempo=2.0000[a]"), "fc: {fc}");
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_builds_blackpoint_contrast_vibrance_chain() -> Result<()> {
+        // strength 0.5 -> black 0.05, contrast 1.075, sat 1.175, gamma 1.030,
+        // vibrance 0.45. The black-point curve must come first (veil removal),
+        // then eq, then vibrance.
+        let args = args_of(&FFmpegCommand::new("in.mp4", "out.mp4").dehaze(0.5).build());
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert_eq!(
+            fc,
+            "[0:v]curves=all='0.050/0 1/1',eq=contrast=1.075:saturation=1.175:gamma=1.030,vibrance=intensity=0.450,format=yuv420p[v]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_clamps_strength_to_valid_range() -> Result<()> {
+        // Strengths above 1.0 are clamped: otherwise the black point reaches/
+        // exceeds 1.0 (a non-increasing curves point) and vibrance/saturation
+        // leave their valid ranges, which FFmpeg rejects.
+        let at_max = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(1.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        let over_max = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(10.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        assert_eq!(at_max, over_max);
+        assert!(at_max.contains("curves=all='0.100/0 1/1'"), "fc: {at_max}");
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_treats_nan_as_zero() -> Result<()> {
+        // `f32::clamp` preserves NaN, which would emit "NaN" into the filter
+        // graph; NaN must degrade to a no-op (strength 0) instead.
+        let nan = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .dehaze(f32::NAN)
+                .build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        let zero = filter_complex(&args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4").dehaze(0.0).build(),
+        ))
+        .context("expected -filter_complex")?
+        .clone();
+        assert_eq!(nan, zero);
+        assert!(!nan.contains("NaN"), "fc must not contain NaN: {nan}");
+        Ok(())
+    }
+
+    #[test]
+    fn dehaze_runs_after_a_lut() -> Result<()> {
+        // Dehaze grades the Rec.709 image, so it must follow the LUT.
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .lut3d("grade.cube")
+                .dehaze(1.0)
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(
+            fc.starts_with("[0:v]lut3d=grade.cube,curves=all="),
+            "fc: {fc}"
+        );
+        assert!(fc.ends_with("format=yuv420p[v]"), "fc: {fc}");
         Ok(())
     }
 

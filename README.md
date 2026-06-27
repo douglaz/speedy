@@ -36,6 +36,9 @@ This project is a Rust workspace with two crates:
 - **Color enhancement filters**:
   - Contrast and saturation
   - Vibrance (intelligent saturation that protects skin tones)
+  - Dehaze (`--dehaze`) — removes atmospheric haze by pulling the black point,
+    adding contrast, and restoring saturation/vibrance (a DaVinci-style "dehaze"
+    approximated with `curves`/`eq`/`vibrance`)
   - Color curves (presets or custom curve definitions)
   - Color balance across shadows, midtones, and highlights
   - Selective color adjustments
@@ -150,6 +153,9 @@ speedy -i /path/to/DCIM/DJI_001 \
 # Vibrance plus a lighter curve
 speedy -i input.mp4 -o output.mp4 --vibrance 0.5 --curves "preset=lighter"
 
+# Remove atmospheric haze from flat/weather-affected footage (0.5 = medium)
+speedy -i hazy.mp4 -o clear.mp4 --dehaze 0.5
+
 # Cinematic teal and orange look
 speedy -i input.mp4 -o output.mp4 --preset cinematic
 
@@ -197,6 +203,7 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `--denoise <1-10>` | Denoising strength | — |
 | `--sharpen <0.1-2.0>` | Sharpening strength | — |
 | `--vibrance <-2.0..2.0>` | Vibrance (protects skin tones) | — |
+| `--dehaze <STRENGTH>` | Remove atmospheric haze (~`0.5` medium, `1.0` strong) | — |
 | `--curves <SPEC>` | Color curves, e.g. `preset=lighter` | — |
 | `--hue-shift <-180..180>` | Hue shift in degrees | — |
 | `--color-balance <SPEC>` | `shadows,midtones,highlights` as `r:g:b` | — |
