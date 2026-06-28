@@ -315,7 +315,7 @@ impl VideoProcessor {
             // upscaled; clips of other sizes are scaled to fit and padded.
             let (width, height) = infos
                 .iter()
-                .map(display_dimensions)
+                .map(|i| target_dimensions(i, self.auto_rotate))
                 .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
                 .unwrap_or((info.width, info.height));
             log::info!(
@@ -645,7 +645,7 @@ impl VideoProcessor {
             .collect::<Result<Vec<_>>>()?;
         let (width, height) = infos
             .iter()
-            .map(display_dimensions)
+            .map(|i| target_dimensions(i, self.auto_rotate))
             .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
             .unwrap_or((info.width, info.height));
         log::info!(
@@ -796,7 +796,8 @@ fn validate_speed(multiplier: f64) -> Result<()> {
 fn parse_scale(spec: &str) -> Option<(i32, i32)> {
     let (w, h) = spec.split_once('x').or_else(|| spec.split_once(':'))?;
     let width: i32 = w.trim().parse().ok()?;
-    let height: i32 = h.trim().parse().unwrap_or(-1);
+    // -1 (auto) is valid and parses fine; a non-numeric height is malformed.
+    let height: i32 = h.trim().parse().ok()?;
     Some((width, height))
 }
 
@@ -805,6 +806,19 @@ fn parse_scale(spec: &str) -> Option<(i32, i32)> {
 fn display_dimensions(info: &crate::VideoInfo) -> (u32, u32) {
     if info.rotation.abs() % 180 == 90 {
         (info.height, info.width)
+    } else {
+        (info.width, info.height)
+    }
+}
+
+/// The frame size the scale/pad target should match for stitching. With
+/// autorotation on (default), filters see the rotated display frame, so use
+/// display dimensions. With `--no-auto-rotate`, ffmpeg keeps the stored frame,
+/// so use the stored dimensions — otherwise a rotated clip is scaled/padded into
+/// a swapped canvas and comes out sideways and letterboxed.
+fn target_dimensions(info: &crate::VideoInfo, auto_rotate: bool) -> (u32, u32) {
+    if auto_rotate {
+        display_dimensions(info)
     } else {
         (info.width, info.height)
     }
@@ -929,9 +943,21 @@ mod tests {
             .position(|a| a == "-filter_complex")
             .expect("expected -filter_complex");
         let fc = &args[idx + 1];
-        let lut_at = fc.find("lut3d=grade.cube").expect("lut present");
+        let lut_at = fc.find("lut3d=file='grade.cube'").expect("lut present");
         let dehaze_at = fc.find("curves=all=").expect("dehaze present");
         assert!(lut_at < dehaze_at, "lut must precede dehaze: {fc}");
+    }
+
+    #[test]
+    fn target_dimensions_uses_stored_dims_when_autorotate_off() {
+        // -90 clip: stored portrait 3384x6016, displays landscape 6016x3384.
+        let rotated = info(3384, 6016, -90);
+        assert_eq!(target_dimensions(&rotated, true), (6016, 3384)); // display
+        assert_eq!(target_dimensions(&rotated, false), (3384, 6016)); // stored
+        // Unrotated clip is identical either way.
+        let upright = info(3840, 2160, 0);
+        assert_eq!(target_dimensions(&upright, true), (3840, 2160));
+        assert_eq!(target_dimensions(&upright, false), (3840, 2160));
     }
 
     #[test]
@@ -949,9 +975,10 @@ mod tests {
         assert_eq!(parse_scale("1920x1080"), Some((1920, 1080)));
         assert_eq!(parse_scale("1920:-1"), Some((1920, -1)));
         assert_eq!(parse_scale("1280x-1"), Some((1280, -1)));
-        // No separator, or a non-numeric width: malformed.
+        // No separator, or a non-numeric width/height: malformed.
         assert_eq!(parse_scale("1920"), None);
         assert_eq!(parse_scale("axb"), None);
+        assert_eq!(parse_scale("1920xabc"), None);
     }
 
     #[test]

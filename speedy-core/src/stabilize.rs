@@ -218,7 +218,13 @@ pub fn concat(segments: &[PathBuf], output: &Path) -> Result<()> {
     if segments.is_empty() {
         bail!("no segments to concat");
     }
-    let dir = segments[0].parent().unwrap_or_else(|| Path::new("."));
+    // We reference segments by filename and run from one directory, so they must
+    // all live in it; otherwise a basename could resolve to the wrong file.
+    let parent0 = segments[0].parent();
+    if segments.iter().any(|s| s.parent() != parent0) {
+        bail!("all concat segments must be in the same directory");
+    }
+    let dir = parent0.unwrap_or_else(|| Path::new("."));
     let list = dir.join("concat-list.txt");
     let mut body = String::new();
     for seg in segments {
@@ -282,6 +288,13 @@ mod tests {
     fn concat_rejects_empty_segment_list() {
         let r = concat(&[], Path::new("/tmp/out.mp4"));
         assert!(r.is_err(), "empty segment list must error");
+    }
+
+    #[test]
+    fn concat_rejects_segments_from_different_dirs() {
+        // Referencing by basename from one dir would resolve the wrong file.
+        let segs = vec![PathBuf::from("/a/x.mkv"), PathBuf::from("/b/y.mkv")];
+        assert!(concat(&segs, Path::new("/tmp/out.mp4")).is_err());
     }
 
     #[test]

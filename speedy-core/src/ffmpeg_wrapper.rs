@@ -260,11 +260,14 @@ impl FFmpegCommand {
         self
     }
 
-    /// Apply 3D LUT
+    /// Apply a 3D LUT. The path is single-quoted (with embedded `'` escaped as
+    /// `'\''`) so commas/colons/spaces in the filename aren't parsed as
+    /// filtergraph syntax. For an absolute path whose *directory* has special
+    /// characters (e.g. a Windows drive), pair this with `current_dir` and pass
+    /// the basename (see `VideoProcessor::apply_grade`).
     pub fn lut3d(mut self, lut_file: impl AsRef<Path>) -> Self {
-        // Don't add extra quotes - FFmpeg handles the path properly
-        self.video_filters
-            .push(format!("lut3d={}", lut_file.as_ref().display()));
+        let escaped = lut_file.as_ref().to_string_lossy().replace('\'', "'\\''");
+        self.video_filters.push(format!("lut3d=file='{escaped}'"));
         self
     }
 
@@ -862,7 +865,7 @@ mod tests {
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         // The LUT runs in RGB; the chain must end in yuv420p for compatibility.
-        assert_eq!(fc, "[0:v]lut3d=grade.cube,format=yuv420p[v]");
+        assert_eq!(fc, "[0:v]lut3d=file='grade.cube',format=yuv420p[v]");
         assert!(has_pair(&args, "-map", "[v]"));
         Ok(())
     }
@@ -897,7 +900,7 @@ mod tests {
         assert!(fc.contains("setpts=PTS-STARTPTS[v0]"), "graph: {fc}");
         assert!(fc.contains("concat=n=3:v=1[cat]"), "graph: {fc}");
         assert!(
-            fc.contains("[cat]lut3d=grade.cube,format=yuv420p[v]"),
+            fc.contains("[cat]lut3d=file='grade.cube',format=yuv420p[v]"),
             "graph: {fc}"
         );
         assert!(has_pair(&args, "-map", "[v]"));
@@ -959,7 +962,7 @@ mod tests {
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert_eq!(
             fc,
-            "[0:v]setpts=0.1000*PTS,fps=30,lut3d=grade.cube,format=yuv420p[v]"
+            "[0:v]setpts=0.1000*PTS,fps=30,lut3d=file='grade.cube',format=yuv420p[v]"
         );
         Ok(())
     }
@@ -1048,7 +1051,7 @@ mod tests {
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert!(
-            fc.starts_with("[0:v]lut3d=grade.cube,curves=all="),
+            fc.starts_with("[0:v]lut3d=file='grade.cube',curves=all="),
             "fc: {fc}"
         );
         assert!(fc.ends_with("format=yuv420p[v]"), "fc: {fc}");
@@ -1085,7 +1088,7 @@ mod tests {
         assert!(
             fc.starts_with(
                 "[0:v]scale=3840:2160:force_original_aspect_ratio=decrease,\
-                 pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,lut3d=grade.cube"
+                 pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,lut3d=file='grade.cube'"
             ),
             "fc: {fc}"
         );
