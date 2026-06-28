@@ -626,6 +626,9 @@ impl VideoProcessor {
                 "Some clips have audio, but stabilized stitched output is video-only; audio will be dropped"
             );
         }
+        // Normalize every segment to a common frame rate so the stream-copy
+        // concat sees matching time bases (mirrors the non-stabilized path).
+        let common_fps = probe_video_fps(&self.inputs[0], info.fps);
 
         let mut segments = Vec::with_capacity(self.inputs.len());
         for (i, clip) in self.inputs.iter().enumerate() {
@@ -642,7 +645,7 @@ impl VideoProcessor {
                 .quality(inter_q)
                 .video_only()
                 .overwrite()
-                .scale_pad(width, height);
+                .scale_pad(width, height, &common_fps);
             if let Some(threads) = self.threads {
                 cmd = cmd.threads(threads);
             }

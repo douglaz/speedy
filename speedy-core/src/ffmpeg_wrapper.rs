@@ -101,15 +101,16 @@ impl FFmpegCommand {
         self
     }
 
-    /// Normalize a single input to `width`x`height`, scaling to fit (preserving
-    /// aspect) and padding, with square pixels. Intended as the first filter so
-    /// later filters (and stabilization) operate on the common frame. This is
-    /// the per-clip equivalent of [`concat_normalize`](Self::concat_normalize)'s
-    /// scaling, for the per-segment stabilization path.
-    pub fn scale_pad(mut self, width: u32, height: u32) -> Self {
+    /// Normalize a single input to `width`x`height` at `fps`, scaling to fit
+    /// (preserving aspect), padding, with square pixels and a common frame rate.
+    /// Intended as the first filter so later filters (and stabilization) operate
+    /// on the common frame, and so per-segment stabilized clips share a frame
+    /// rate / time base before a stream-copy concat. This is the per-clip
+    /// equivalent of [`concat_normalize`](Self::concat_normalize).
+    pub fn scale_pad(mut self, width: u32, height: u32, fps: &str) -> Self {
         self.video_filters.push(format!(
             "scale={width}:{height}:force_original_aspect_ratio=decrease,\
-             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
         ));
         self
     }
@@ -1027,7 +1028,7 @@ mod tests {
     fn scale_pad_is_the_first_filter() -> Result<()> {
         let args = args_of(
             &FFmpegCommand::new("in.mp4", "out.mp4")
-                .scale_pad(3840, 2160)
+                .scale_pad(3840, 2160, "30")
                 .lut3d("grade.cube")
                 .build(),
         );
@@ -1035,7 +1036,7 @@ mod tests {
         assert!(
             fc.starts_with(
                 "[0:v]scale=3840:2160:force_original_aspect_ratio=decrease,\
-                 pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,lut3d=grade.cube"
+                 pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,lut3d=grade.cube"
             ),
             "fc: {fc}"
         );
