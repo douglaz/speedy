@@ -37,6 +37,9 @@ pub struct FFmpegCommand {
     /// reference files by name (avoiding filtergraph path-escaping pitfalls with
     /// colons/backslashes in absolute paths).
     working_dir: Option<PathBuf>,
+    /// When set, disable ffmpeg's automatic rotation (`-noautorotate`) on every
+    /// input, so footage keeps its stored orientation.
+    no_autorotate: bool,
 }
 
 impl FFmpegCommand {
@@ -67,6 +70,7 @@ impl FFmpegCommand {
             total_duration: None,
             video_only: false,
             working_dir: None,
+            no_autorotate: false,
         }
     }
 
@@ -98,6 +102,13 @@ impl FFmpegCommand {
     /// reference files by name and avoid filtergraph path-escaping issues.
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.working_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Disable ffmpeg's automatic rotation on every input (`-noautorotate`), so
+    /// the stored orientation is kept as-is.
+    pub fn disable_autorotate(mut self) -> Self {
+        self.no_autorotate = true;
         self
     }
 
@@ -399,12 +410,15 @@ impl FFmpegCommand {
         self
     }
 
-    /// Preserve metadata
+    /// Preserve metadata. `-movflags use_metadata_tags` is MP4/MOV-specific, so
+    /// it's only added for those containers (it errors/warns on MKV/WebM/etc.).
     pub fn preserve_metadata(mut self) -> Self {
         self.metadata_args.push("-map_metadata".to_string());
         self.metadata_args.push("0".to_string());
-        self.metadata_args.push("-movflags".to_string());
-        self.metadata_args.push("use_metadata_tags".to_string());
+        if is_mp4_family(&self.output) {
+            self.metadata_args.push("-movflags".to_string());
+            self.metadata_args.push("use_metadata_tags".to_string());
+        }
         self
     }
 
@@ -444,9 +458,13 @@ impl FFmpegCommand {
             cmd.args(["-hwaccel", hw]);
         }
 
-        // Input files (autorotation is enabled by default for each).
+        // Input files. Autorotation is on by default per input; `-noautorotate`
+        // (an input option, so it precedes each `-i`) disables it.
         // Pass the path as an OsStr so non-UTF-8 paths don't panic.
         for input in &self.inputs {
+            if self.no_autorotate {
+                cmd.arg("-noautorotate");
+            }
             cmd.arg("-i").arg(input);
         }
 
@@ -583,7 +601,10 @@ impl FFmpegCommand {
         F: Fn(f64, String) + Send + 'static,
     {
         let mut cmd = self.build();
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Progress is parsed from stderr; stdout is unused. Discard it rather
+        // than pipe-without-draining, which could deadlock if ffmpeg writes a
+        // lot to stdout (e.g. a stream muxed to "-").
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
         log::info!("Executing FFmpeg command: {:?}", cmd);
 
@@ -679,6 +700,19 @@ impl FFmpegCommand {
     }
 }
 
+/// Whether `path`'s extension is an MP4/MOV-family container, where `-movflags`
+/// (`use_metadata_tags`, `+faststart`) applies. Other containers (MKV, WebM)
+/// reject those flags.
+pub fn is_mp4_family(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "m4v")
+    )
+}
+
 /// Check if FFmpeg is available and return version info
 pub fn check_ffmpeg() -> Result<String> {
     let output = Command::new("ffmpeg")
@@ -711,6 +745,21 @@ pub fn get_video_info(path: impl AsRef<Path>) -> Result<VideoInfo> {
         .arg(path.as_ref())
         .output()
         .context("Failed to run ffprobe")?;
+
+    // ffprobe failed (missing/corrupt file, etc.): don't silently return zeroed
+    // metadata, which would feed a bogus 0x0 / 0fps plan into the pipeline.
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe failed for {path} (exit {code}): {stderr}",
+            path = path.as_ref().display(),
+            code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            stderr = String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let json = String::from_utf8_lossy(&output.stdout);
 
@@ -1041,6 +1090,59 @@ mod tests {
             "fc: {fc}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn disable_autorotate_emits_noautorotate_before_each_input() {
+        let args = args_of(
+            &FFmpegCommand::new_multi(
+                vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
+                "out.mp4",
+            )
+            .disable_autorotate()
+            .build(),
+        );
+        // -noautorotate is an input option, so it must immediately precede each -i.
+        let i_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "-i")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(i_positions.len(), 2, "args: {args:?}");
+        for p in i_positions {
+            assert!(p > 0 && args[p - 1] == "-noautorotate", "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn preserve_metadata_movflags_only_for_mp4_family() {
+        let mp4 = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .preserve_metadata()
+                .build(),
+        );
+        assert!(has_pair(&mp4, "-movflags", "use_metadata_tags"), "{mp4:?}");
+        let mkv = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mkv")
+                .preserve_metadata()
+                .build(),
+        );
+        assert!(
+            !mkv.iter().any(|a| a == "-movflags"),
+            "mkv must not get -movflags: {mkv:?}"
+        );
+        assert!(has_pair(&mkv, "-map_metadata", "0"), "{mkv:?}");
+    }
+
+    #[test]
+    fn is_mp4_family_matches_mp4_mov_m4v_only() {
+        for ok in ["a.mp4", "a.MOV", "clip.m4v"] {
+            assert!(is_mp4_family(Path::new(ok)), "{ok}");
+        }
+        for no in ["a.mkv", "a.webm", "a.avi", "noext"] {
+            assert!(!is_mp4_family(Path::new(no)), "{no}");
+        }
     }
 
     #[test]

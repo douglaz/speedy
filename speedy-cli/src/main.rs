@@ -187,8 +187,9 @@ fn main() -> Result<()> {
         .output
         .ok_or_else(|| anyhow::anyhow!("Output file required"))?;
 
-    // Create output directory if it doesn't exist
-    if let Some(parent) = output.parent() {
+    // Create output directory if it doesn't exist. Skip an empty parent (a bare
+    // filename like `out.mp4`), where create_dir_all("") would error.
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).context("Failed to create output directory")?;
     }
 
