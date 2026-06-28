@@ -33,6 +33,10 @@ pub struct FFmpegCommand {
     /// When set, the output carries no audio (audio is neither filtered nor
     /// mapped). Used for stabilization intermediates.
     video_only: bool,
+    /// Working directory for the ffmpeg process. Lets filter option values
+    /// reference files by name (avoiding filtergraph path-escaping pitfalls with
+    /// colons/backslashes in absolute paths).
+    working_dir: Option<PathBuf>,
 }
 
 impl FFmpegCommand {
@@ -62,6 +66,7 @@ impl FFmpegCommand {
             concat_normalize: None,
             total_duration: None,
             video_only: false,
+            working_dir: None,
         }
     }
 
@@ -86,6 +91,13 @@ impl FFmpegCommand {
     /// Drop audio entirely: do not build audio filters, and map only video.
     pub fn video_only(mut self) -> Self {
         self.video_only = true;
+        self
+    }
+
+    /// Run ffmpeg from this working directory, so filter option values can
+    /// reference files by name and avoid filtergraph path-escaping issues.
+    pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.working_dir = Some(dir.as_ref().to_path_buf());
         self
     }
 
@@ -415,6 +427,11 @@ impl FFmpegCommand {
     /// Build the FFmpeg command
     pub fn build(&self) -> Command {
         let mut cmd = Command::new("ffmpeg");
+
+        // Run from the configured working directory, if any.
+        if let Some(ref dir) = self.working_dir {
+            cmd.current_dir(dir);
+        }
 
         // Global options
         if self.overwrite {

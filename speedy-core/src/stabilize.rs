@@ -55,18 +55,29 @@ pub struct EncodeOpts<'a> {
     pub threads: Option<usize>,
 }
 
-/// Escape a filesystem path for embedding as a filtergraph option value, so a
-/// Windows drive path (`C:\...`), backslashes, or quotes are not parsed as
-/// filter syntax. See ffmpeg's notes on filtergraph escaping.
-fn escape_filter_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace(':', "\\:")
+/// The trailing filename of a path (for referencing a `.trf` by name from the
+/// ffmpeg working directory), falling back to the full path string.
+fn file_name_str(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Count the video frames in a file via ffprobe's `nb_frames`, or `None` when it
-/// is missing/unreadable (e.g. a truncated file from a crashed encode).
+/// The directory to run ffmpeg from for a `.trf` path: its parent, unless that
+/// is empty (a bare filename), in which case `None`.
+fn work_dir(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => Some(p),
+        _ => None,
+    }
+}
+
+/// Count the video frames in a file by counting demuxed packets, or `None` when
+/// the file is missing/unreadable (e.g. a truncated file from a crashed encode).
+///
+/// Counting packets (one per coded frame for the codecs used here) is
+/// container-agnostic and fast — unlike `nb_frames`, which Matroska does not
+/// populate (our stabilization intermediates are `.mkv`).
 pub fn frame_count(path: &Path) -> Option<u64> {
     let output = Command::new("ffprobe")
         .args([
@@ -74,8 +85,9 @@ pub fn frame_count(path: &Path) -> Option<u64> {
             "error",
             "-select_streams",
             "v:0",
+            "-count_packets",
             "-show_entries",
-            "stream=nb_frames",
+            "stream=nb_read_packets",
             "-of",
             "csv=p=0",
         ])
@@ -90,11 +102,14 @@ pub fn frame_count(path: &Path) -> Option<u64> {
 /// Detection runs on a brightness-normalized copy so exposure changes do not
 /// register as motion. Retried until the `.trf` is written non-empty.
 pub fn detect(input: &Path, trf: &Path, params: &VidstabParams, attempts: u32) -> Result<()> {
+    // Reference the .trf by filename and run from its directory, so an absolute
+    // path with colons/backslashes (e.g. a Windows temp dir) never reaches the
+    // filtergraph parser (which mis-parses such paths even when escaped/quoted).
     let vf = format!(
-        "normalize=smoothing=0,vidstabdetect=shakiness={shakiness}:accuracy={accuracy}:result={trf}",
+        "normalize=smoothing=0,vidstabdetect=shakiness={shakiness}:accuracy={accuracy}:result={name}",
         shakiness = params.shakiness,
         accuracy = params.accuracy,
-        trf = escape_filter_path(trf),
+        name = file_name_str(trf),
     );
     for attempt in 1..=attempts {
         if let Err(e) = std::fs::remove_file(trf)
@@ -102,7 +117,11 @@ pub fn detect(input: &Path, trf: &Path, params: &VidstabParams, attempts: u32) -
         {
             log::debug!("could not remove stale trf {trf}: {e}", trf = trf.display());
         }
-        let status = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        if let Some(dir) = work_dir(trf) {
+            command.current_dir(dir);
+        }
+        let status = command
             .args(["-y", "-hide_banner", "-loglevel", "error"])
             .arg("-i")
             .arg(input)
@@ -138,20 +157,26 @@ pub fn transform(
     let want = frame_count(input);
     // optzoom=1 crops just enough to hide the stabilization borders; the unsharp
     // counters the softening introduced by the warp interpolation. The trailing
-    // format is added by FFmpegCommand for encoder compatibility.
+    // format is added by FFmpegCommand for encoder compatibility. The .trf is
+    // referenced by filename (with current_dir) to dodge filtergraph path
+    // escaping; the output is absolutized so current_dir doesn't redirect it.
     let vf = format!(
-        "vidstabtransform=input={trf}:smoothing={smoothing}:optzoom=1:interpol=bicubic,\
+        "vidstabtransform=input={name}:smoothing={smoothing}:optzoom=1:interpol=bicubic,\
          unsharp=5:5:0.6:3:3:0.3",
-        trf = escape_filter_path(trf),
+        name = file_name_str(trf),
         smoothing = params.smoothing,
     );
+    let output_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
     for attempt in 1..=attempts {
-        let mut cmd = FFmpegCommand::new(input, output)
+        let mut cmd = FFmpegCommand::new(input, &output_abs)
             .video_filter(&vf)
             .video_codec(enc.codec)
             .quality(enc.quality)
             .video_only()
             .overwrite();
+        if let Some(dir) = work_dir(trf) {
+            cmd = cmd.current_dir(dir);
+        }
         if let Some(bitrate) = enc.bitrate {
             cmd = cmd.bitrate(bitrate);
         }
@@ -159,7 +184,7 @@ pub fn transform(
             cmd = cmd.threads(threads);
         }
         let ran = cmd.execute(|_, _| {});
-        let got = frame_count(output);
+        let got = frame_count(&output_abs);
         if ran.is_ok() && want.is_some() && got == want {
             return Ok(());
         }
@@ -237,13 +262,21 @@ mod tests {
     }
 
     #[test]
-    fn escape_filter_path_escapes_colon_and_backslash() {
-        let p = escape_filter_path(Path::new("C:\\tmp\\x.trf"));
-        // Raw "C:" would be parsed as a filter option boundary; it must be escaped.
-        assert!(!p.contains("C:"), "colon must be escaped: {p}");
-        assert!(p.contains("C\\:"), "expected escaped colon: {p}");
-        assert!(p.contains("\\\\tmp"), "expected escaped backslash: {p}");
-        // A clean POSIX path is unchanged.
-        assert_eq!(escape_filter_path(Path::new("/tmp/x.trf")), "/tmp/x.trf");
+    fn trf_is_referenced_by_bare_filename() {
+        // The filter must reference the .trf by name (no directory), so an
+        // absolute path with colons/backslashes never hits the filtergraph.
+        let name = file_name_str(Path::new("/tmp/speedy-stab-1/t_0.trf"));
+        assert_eq!(name, "t_0.trf");
+        assert!(!name.contains('/') && !name.contains(':'), "name: {name}");
+    }
+
+    #[test]
+    fn work_dir_is_the_parent_or_none() {
+        assert_eq!(
+            work_dir(Path::new("/tmp/speedy-stab-1/t_0.trf")),
+            Some(Path::new("/tmp/speedy-stab-1"))
+        );
+        // A bare filename has no usable working directory.
+        assert_eq!(work_dir(Path::new("t_0.trf")), None);
     }
 }
