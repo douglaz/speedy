@@ -11,6 +11,7 @@
 
 pub mod ffmpeg_wrapper;
 pub mod presets;
+pub mod stabilize;
 pub mod video_processor;
 
 // Re-export commonly used types at the crate root

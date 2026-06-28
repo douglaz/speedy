@@ -30,6 +30,13 @@ pub struct FFmpegCommand {
     /// Known total duration in seconds, used for progress because the concat
     /// filter does not produce a single `Duration` line FFmpeg can report.
     total_duration: Option<f64>,
+    /// When set, the output carries no audio (audio is neither filtered nor
+    /// mapped). Used for stabilization intermediates.
+    video_only: bool,
+    /// Working directory for the ffmpeg process. Lets filter option values
+    /// reference files by name (avoiding filtergraph path-escaping pitfalls with
+    /// colons/backslashes in absolute paths).
+    working_dir: Option<PathBuf>,
 }
 
 impl FFmpegCommand {
@@ -58,6 +65,8 @@ impl FFmpegCommand {
             hw_accel: None,
             concat_normalize: None,
             total_duration: None,
+            video_only: false,
+            working_dir: None,
         }
     }
 
@@ -76,6 +85,33 @@ impl FFmpegCommand {
     /// Needed for concat, where FFmpeg cannot report a single Duration line.
     pub fn total_duration(mut self, seconds: f64) -> Self {
         self.total_duration = Some(seconds);
+        self
+    }
+
+    /// Drop audio entirely: do not build audio filters, and map only video.
+    pub fn video_only(mut self) -> Self {
+        self.video_only = true;
+        self
+    }
+
+    /// Run ffmpeg from this working directory, so filter option values can
+    /// reference files by name and avoid filtergraph path-escaping issues.
+    pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.working_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Normalize a single input to `width`x`height` at `fps`, scaling to fit
+    /// (preserving aspect), padding, with square pixels and a common frame rate.
+    /// Intended as the first filter so later filters (and stabilization) operate
+    /// on the common frame, and so per-segment stabilized clips share a frame
+    /// rate / time base before a stream-copy concat. This is the per-clip
+    /// equivalent of [`concat_normalize`](Self::concat_normalize).
+    pub fn scale_pad(mut self, width: u32, height: u32, fps: &str) -> Self {
+        self.video_filters.push(format!(
+            "scale={width}:{height}:force_original_aspect_ratio=decrease,\
+             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+        ));
         self
     }
 
@@ -393,6 +429,11 @@ impl FFmpegCommand {
     pub fn build(&self) -> Command {
         let mut cmd = Command::new("ffmpeg");
 
+        // Run from the configured working directory, if any.
+        if let Some(ref dir) = self.working_dir {
+            cmd.current_dir(dir);
+        }
+
         // Global options
         if self.overwrite {
             cmd.arg("-y");
@@ -459,7 +500,7 @@ impl FFmpegCommand {
                 has_video_filters = true;
             }
 
-            if !self.audio_filters.is_empty() {
+            if !self.video_only && !self.audio_filters.is_empty() {
                 if has_video_filters {
                     filter_complex.push_str("; ");
                 }
@@ -480,9 +521,15 @@ impl FFmpegCommand {
 
                 if has_audio_filters {
                     cmd.args(["-map", "[a]"]);
-                } else {
+                } else if !self.video_only {
                     cmd.args(["-map", "0:a?"]);
                 }
+            }
+
+            // Drop audio entirely for video-only outputs (also covers the
+            // no-filter case, where ffmpeg would otherwise map audio by default).
+            if self.video_only {
+                cmd.arg("-an");
             }
         }
 
@@ -956,6 +1003,43 @@ mod tests {
             "fc: {fc}"
         );
         assert!(fc.ends_with("format=yuv420p[v]"), "fc: {fc}");
+        Ok(())
+    }
+
+    #[test]
+    fn video_only_single_input_drops_audio() -> Result<()> {
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .video_filter("scale=100:100")
+                .video_only()
+                .build(),
+        );
+        // Video is mapped, audio is neither mapped nor passed through.
+        assert!(has_pair(&args, "-map", "[v]"), "args: {args:?}");
+        assert!(
+            !has_pair(&args, "-map", "0:a?"),
+            "must not map audio: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "-an"), "expected -an: {args:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn scale_pad_is_the_first_filter() -> Result<()> {
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .scale_pad(3840, 2160, "30")
+                .lut3d("grade.cube")
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(
+            fc.starts_with(
+                "[0:v]scale=3840:2160:force_original_aspect_ratio=decrease,\
+                 pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,lut3d=grade.cube"
+            ),
+            "fc: {fc}"
+        );
         Ok(())
     }
 

@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 
+use crate::stabilize::{self, VidstabParams};
 use crate::{ColorProfile, FFmpegCommand, check_ffmpeg, get_video_info};
 
 // Type alias for color balance values (shadows RGB, midtones RGB, highlights RGB)
@@ -39,6 +40,9 @@ pub struct VideoProcessor {
     output_fps: Option<String>,
     /// Haze-removal strength (~0.5 medium, 1.0 strong). `None` disables it.
     dehaze: Option<f32>,
+    /// vidstab smoothing window (frames) used when `stabilize` is set. `None`
+    /// uses the tuned default.
+    stabilize_smoothing: Option<u32>,
 }
 
 impl VideoProcessor {
@@ -74,6 +78,7 @@ impl VideoProcessor {
             selective_color: None,
             output_fps: None,
             dehaze: None,
+            stabilize_smoothing: None,
         }
     }
 
@@ -94,6 +99,13 @@ impl VideoProcessor {
     /// Pulls the black point, adds contrast, and restores saturation/vibrance.
     pub fn dehaze(mut self, strength: f32) -> Self {
         self.dehaze = Some(strength);
+        self
+    }
+
+    /// Set the vidstab smoothing window (frames) used when stabilization is
+    /// enabled. Higher is a glassier glide; lower follows the camera more.
+    pub fn stabilize_smoothing(mut self, frames: u32) -> Self {
+        self.stabilize_smoothing = Some(frames);
         self
     }
 
@@ -269,6 +281,18 @@ impl VideoProcessor {
             if info.has_audio { "yes" } else { "no" }
         );
 
+        // Smoothing only affects the stabilization path; warn if it's a no-op
+        // here, where the effective stabilize state (incl. presets) is known.
+        if self.stabilize_smoothing.is_some() && !self.stabilize {
+            log::warn!("stabilize_smoothing has no effect without stabilization enabled");
+        }
+
+        // Stabilization needs a different pipeline (per-clip, two-pass vidstab),
+        // so route it out before building the single stitch/grade command.
+        if self.stabilize {
+            return self.process_stabilized(&info);
+        }
+
         // When multiple clips are given, probe every clip so we can pick a
         // common output resolution and sum the durations (for the progress bar).
         let stitching = self.inputs.len() > 1;
@@ -352,137 +376,9 @@ impl VideoProcessor {
             }
         }
 
-        // Apply speed adjustment. Resample to a target frame rate (the source
-        // fps unless overridden) so a speed-up yields a shorter clip at a normal
-        // frame rate instead of re-encoding every source frame at a multiplied
-        // fps. A degenerate/unknown source fps falls back to no resampling.
-        if self.speed_multiplier != 1.0 {
-            let target_fps = match &self.output_fps {
-                Some(fps) => {
-                    // Validate an explicit override up front so a bad value
-                    // (e.g. `--output-fps 0` or `0/0`) fails fast with a clear
-                    // message instead of as a late, cryptic ffmpeg error.
-                    if fps_string_value(fps).is_none() {
-                        anyhow::bail!(
-                            "Invalid --output-fps {fps:?}; expected a positive number like \"30\" or \"30000/1001\""
-                        );
-                    }
-                    Some(fps.clone())
-                }
-                None => {
-                    // Default to the source's average cadence, which is the
-                    // correct decimation target for variable-frame-rate inputs.
-                    let probed = probe_target_fps(&self.inputs[0], info.fps);
-                    fps_string_value(&probed).map(|_| probed)
-                }
-            };
-            if let Some(ref fps) = target_fps {
-                log::info!(
-                    "Resampling to {fps} fps after a {speed}x speed change",
-                    speed = self.speed_multiplier
-                );
-            }
-            cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps.as_deref());
-        }
-
-        // Apply LUT if specified or use profile LUT
-        if let Some(ref lut) = self.lut_file {
-            cmd = cmd.lut3d(lut);
-        } else if let Some(profile_lut) = self.get_profile_lut() {
-            log::info!(
-                "Applying {} profile LUT: {}",
-                self.profile.to_string(),
-                profile_lut.display()
-            );
-            cmd = cmd.lut3d(profile_lut);
-        }
-
-        // Apply haze removal (after the LUT, so it grades the Rec.709 image).
-        if let Some(strength) = self.dehaze
-            && strength > 0.0
-        {
-            log::info!("Applying dehaze (strength {strength})");
-            cmd = cmd.dehaze(strength);
-        }
-
-        // Apply color adjustments
-        if self.contrast != 1.0 || self.saturation != 1.0 {
-            cmd = cmd.color_enhance(self.contrast, self.saturation);
-        }
-
-        // Apply stabilization if requested
-        if self.stabilize {
-            log::info!("Applying video stabilization");
-            cmd = cmd.stabilize();
-        }
-
-        // Handle rotation
-        if self.auto_rotate {
-            cmd = cmd.auto_rotate();
-        } else if info.rotation != 0 {
-            // Manual rotation based on metadata
-            match info.rotation {
-                90 => cmd = cmd.rotate(1),        // 90° clockwise
-                -90 | 270 => cmd = cmd.rotate(0), // 90° counter-clockwise
-                180 => cmd = cmd.rotate(2),       // 180°
-                _ => {}
-            }
-        }
-
-        // Apply denoising if requested
-        if let Some(strength) = self.denoise {
-            cmd = cmd.denoise(strength);
-        }
-
-        // Apply sharpening if requested
-        if let Some(strength) = self.sharpen {
-            cmd = cmd.sharpen(strength);
-        }
-
-        // Apply vibrance if requested
-        if let Some(vibrance) = self.vibrance {
-            cmd = cmd.vibrance(vibrance);
-        }
-
-        // Apply curves if requested
-        if let Some(ref curves) = self.curves {
-            cmd = cmd.curves(curves);
-        }
-
-        // Apply hue shift if requested
-        if let Some(hue_shift) = self.hue_shift {
-            cmd = cmd.hue_shift(hue_shift);
-        }
-
-        // Apply color balance if requested
-        if let Some(balance) = self.color_balance {
-            cmd = cmd.color_balance(
-                (balance.0, balance.1, balance.2),
-                (balance.3, balance.4, balance.5),
-                (balance.6, balance.7, balance.8),
-            );
-        }
-
-        // Apply selective color if requested
-        if let Some(ref selective) = self.selective_color {
-            cmd = cmd.selective_color(selective);
-        }
-
-        // Apply scaling if requested
-        if let Some(ref scale_str) = self.scale {
-            // Parse scale string (e.g., "1920x1080" or "1920:-1")
-            if let Some((width_str, height_str)) = scale_str.split_once('x') {
-                if let Ok(width) = width_str.parse::<i32>() {
-                    let height = height_str.parse::<i32>().unwrap_or(-1);
-                    cmd = cmd.scale(width, height);
-                }
-            } else if let Some((width_str, height_str)) = scale_str.split_once(':')
-                && let Ok(width) = width_str.parse::<i32>()
-            {
-                let height = height_str.parse::<i32>().unwrap_or(-1);
-                cmd = cmd.scale(width, height);
-            }
-        }
+        // Apply the grade: speed, LUT, dehaze, colour, rotation, scaling, etc.
+        let target_fps = self.resolve_target_fps(&info)?;
+        cmd = self.apply_grade(cmd, &info, target_fps.as_deref());
 
         // Set up progress bar
         let pb = ProgressBar::new(100);
@@ -509,7 +405,287 @@ impl VideoProcessor {
 
         Ok(())
     }
+
+    /// Resolve the decimation target frame rate for a speed change. `None` when
+    /// the speed is unchanged or the source fps cannot be determined. Errors on
+    /// an explicit but invalid `--output-fps`.
+    fn resolve_target_fps(&self, info: &crate::VideoInfo) -> Result<Option<String>> {
+        if self.speed_multiplier == 1.0 {
+            return Ok(None);
+        }
+        let target = match &self.output_fps {
+            Some(fps) => {
+                if fps_string_value(fps).is_none() {
+                    anyhow::bail!(
+                        "Invalid --output-fps {fps:?}; expected a positive number like \"30\" or \"30000/1001\""
+                    );
+                }
+                Some(fps.clone())
+            }
+            None => {
+                let probed = probe_target_fps(&self.inputs[0], info.fps);
+                fps_string_value(&probed).map(|_| probed)
+            }
+        };
+        Ok(target)
+    }
+
+    /// Apply the colour/speed/geometry grade — everything except stitch
+    /// normalization and stabilization — to a command in a fixed order. Shared
+    /// by the single-command path and the per-clip stabilization path.
+    fn apply_grade(
+        &self,
+        mut cmd: FFmpegCommand,
+        info: &crate::VideoInfo,
+        target_fps: Option<&str>,
+    ) -> FFmpegCommand {
+        // Speed (resampled to the target fps so a speed-up drops frames).
+        if self.speed_multiplier != 1.0 {
+            if let Some(fps) = target_fps {
+                log::info!(
+                    "Resampling to {fps} fps after a {speed}x speed change",
+                    speed = self.speed_multiplier
+                );
+            }
+            cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps);
+        }
+
+        // LUT (explicit, else from the colour profile).
+        if let Some(ref lut) = self.lut_file {
+            cmd = cmd.lut3d(lut);
+        } else if let Some(profile_lut) = self.get_profile_lut() {
+            log::info!(
+                "Applying {} profile LUT: {}",
+                self.profile.to_string(),
+                profile_lut.display()
+            );
+            cmd = cmd.lut3d(profile_lut);
+        }
+
+        // Dehaze (after the LUT, so it grades the Rec.709 image).
+        if let Some(strength) = self.dehaze
+            && strength > 0.0
+        {
+            log::info!("Applying dehaze (strength {strength})");
+            cmd = cmd.dehaze(strength);
+        }
+
+        // Contrast / saturation.
+        if self.contrast != 1.0 || self.saturation != 1.0 {
+            cmd = cmd.color_enhance(self.contrast, self.saturation);
+        }
+
+        // Rotation: auto by default, else manual from metadata.
+        if self.auto_rotate {
+            cmd = cmd.auto_rotate();
+        } else if info.rotation != 0 {
+            match info.rotation {
+                90 => cmd = cmd.rotate(1),
+                -90 | 270 => cmd = cmd.rotate(0),
+                180 => cmd = cmd.rotate(2),
+                _ => {}
+            }
+        }
+
+        if let Some(strength) = self.denoise {
+            cmd = cmd.denoise(strength);
+        }
+        if let Some(strength) = self.sharpen {
+            cmd = cmd.sharpen(strength);
+        }
+        if let Some(vibrance) = self.vibrance {
+            cmd = cmd.vibrance(vibrance);
+        }
+        if let Some(ref curves) = self.curves {
+            cmd = cmd.curves(curves);
+        }
+        if let Some(hue_shift) = self.hue_shift {
+            cmd = cmd.hue_shift(hue_shift);
+        }
+        if let Some(balance) = self.color_balance {
+            cmd = cmd.color_balance(
+                (balance.0, balance.1, balance.2),
+                (balance.3, balance.4, balance.5),
+                (balance.6, balance.7, balance.8),
+            );
+        }
+        if let Some(ref selective) = self.selective_color {
+            cmd = cmd.selective_color(selective);
+        }
+        if let Some(ref scale_str) = self.scale {
+            if let Some((width_str, height_str)) = scale_str.split_once('x') {
+                if let Ok(width) = width_str.parse::<i32>() {
+                    let height = height_str.parse::<i32>().unwrap_or(-1);
+                    cmd = cmd.scale(width, height);
+                }
+            } else if let Some((width_str, height_str)) = scale_str.split_once(':')
+                && let Ok(width) = width_str.parse::<i32>()
+            {
+                let height = height_str.parse::<i32>().unwrap_or(-1);
+                cmd = cmd.scale(width, height);
+            }
+        }
+        cmd
+    }
+
+    /// Stabilize with two-pass `vidstab`. When stitching, each clip is graded
+    /// and stabilized independently before concatenation, so smoothing never
+    /// crosses a cut (no artificial pan at boundaries). Motion is detected on a
+    /// brightness-normalized copy so exposure (EV) changes don't induce shake.
+    /// Stabilized output is video-only.
+    fn process_stabilized(&self, info: &crate::VideoInfo) -> Result<()> {
+        if self.hw_accel {
+            log::warn!(
+                "--hw-accel is not applied on the stabilization path; grade/detect/transform use the software codec"
+            );
+        }
+        let params = VidstabParams {
+            smoothing: self
+                .stabilize_smoothing
+                .unwrap_or(VidstabParams::default().smoothing),
+            ..VidstabParams::default()
+        };
+        let target_fps = self.resolve_target_fps(info)?;
+        // High-quality intermediates so the extra encode generation before the
+        // warp does not visibly degrade the grade.
+        let inter_q = self.quality.min(16);
+
+        // Unique per-call temp dir: the pid alone collides across concurrent
+        // VideoProcessor runs in one process, which would clobber intermediates.
+        let nonce = STAB_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "speedy-stab-{pid}-{nonce}",
+            pid = std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp)
+            .with_context(|| format!("Failed to create temp dir {}", tmp.display()))?;
+
+        let result = self.run_stabilize(info, &tmp, &params, target_fps.as_deref(), inter_q);
+
+        if let Err(e) = std::fs::remove_dir_all(&tmp) {
+            log::debug!("could not clean temp dir {tmp}: {e}", tmp = tmp.display());
+        }
+        result?;
+
+        log::info!("Video processing completed successfully!");
+        log::info!("Output saved to: {:?}", self.output_path);
+        Ok(())
+    }
+
+    /// Inner stabilization driver (grade -> detect -> transform [-> concat]),
+    /// writing intermediates under `tmp`.
+    fn run_stabilize(
+        &self,
+        info: &crate::VideoInfo,
+        tmp: &Path,
+        params: &VidstabParams,
+        target_fps: Option<&str>,
+        inter_q: u8,
+    ) -> Result<()> {
+        // Final-encode settings, mirrored so --bitrate/--threads are honored.
+        let enc = stabilize::EncodeOpts {
+            codec: &self.codec,
+            quality: self.quality,
+            bitrate: self.bitrate,
+            threads: self.threads,
+        };
+        // Matroska intermediates accept every codec speedy supports (incl.
+        // ProRes/VP9/AV1), unlike an `.mp4` intermediate.
+        if self.inputs.len() == 1 {
+            log::info!(
+                "Stabilizing (two-pass vidstab, smoothing={})",
+                params.smoothing
+            );
+            let graded = tmp.join("graded_0.mkv");
+            let mut clip_info = info.clone();
+            clip_info.has_audio = false;
+            let mut cmd = FFmpegCommand::new(&self.inputs[0], &graded)
+                .video_codec(&self.codec)
+                .quality(inter_q)
+                .video_only()
+                .overwrite();
+            if let Some(threads) = self.threads {
+                cmd = cmd.threads(threads);
+            }
+            self.apply_grade(cmd, &clip_info, target_fps)
+                .execute(|_, _| {})?;
+            let trf = tmp.join("t_0.trf");
+            stabilize::detect(&graded, &trf, params, RETRY_ATTEMPTS)?;
+            stabilize::transform(
+                &graded,
+                &self.output_path,
+                &trf,
+                &enc,
+                params,
+                RETRY_ATTEMPTS,
+            )?;
+            return Ok(());
+        }
+
+        // Stitch + stabilize: grade and stabilize each clip independently.
+        let infos = self
+            .inputs
+            .iter()
+            .map(get_video_info)
+            .collect::<Result<Vec<_>>>()?;
+        let (width, height) = infos
+            .iter()
+            .map(display_dimensions)
+            .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
+            .unwrap_or((info.width, info.height));
+        log::info!(
+            "Stabilizing {count} clips per-segment at {width}x{height} (two-pass vidstab, smoothing={smoothing})",
+            count = self.inputs.len(),
+            smoothing = params.smoothing
+        );
+        if infos.iter().any(|i| i.has_audio) {
+            log::warn!(
+                "Some clips have audio, but stabilized stitched output is video-only; audio will be dropped"
+            );
+        }
+        // Normalize every segment to a common frame rate so the stream-copy
+        // concat sees matching time bases (mirrors the non-stabilized path).
+        let common_fps = probe_video_fps(&self.inputs[0], info.fps);
+
+        let mut segments = Vec::with_capacity(self.inputs.len());
+        for (i, clip) in self.inputs.iter().enumerate() {
+            log::info!(
+                "Segment {n}/{total}: grade + stabilize",
+                n = i + 1,
+                total = self.inputs.len()
+            );
+            let mut clip_info = infos[i].clone();
+            clip_info.has_audio = false;
+            let graded = tmp.join(format!("graded_{i}.mkv"));
+            let mut cmd = FFmpegCommand::new(clip, &graded)
+                .video_codec(&self.codec)
+                .quality(inter_q)
+                .video_only()
+                .overwrite()
+                .scale_pad(width, height, &common_fps);
+            if let Some(threads) = self.threads {
+                cmd = cmd.threads(threads);
+            }
+            self.apply_grade(cmd, &clip_info, target_fps)
+                .execute(|_, _| {})?;
+            let trf = tmp.join(format!("t_{i}.trf"));
+            stabilize::detect(&graded, &trf, params, RETRY_ATTEMPTS)?;
+            let stab = tmp.join(format!("stab_{i}.mkv"));
+            stabilize::transform(&graded, &stab, &trf, &enc, params, RETRY_ATTEMPTS)?;
+            segments.push(stab);
+        }
+        stabilize::concat(&segments, &self.output_path)
+    }
 }
+
+/// Number of attempts for each stabilization ffmpeg pass before giving up.
+/// `vidstab`/encoder crashes can be intermittent, leaving a truncated file; we
+/// retry until the pass validates rather than trusting one exit code.
+const RETRY_ATTEMPTS: u32 = 6;
+
+/// Per-process counter making each stabilization run's temp dir unique, so
+/// concurrent `process()` calls in one process don't clobber each other.
+static STAB_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Probe the first *video* stream's base frame rate (`r_frame_rate`) as an
 /// ffmpeg-ready string (e.g. `"30000/1001"`). Falls back to the formatted
@@ -658,6 +834,62 @@ mod tests {
         // Unset by default, so the source fps is used.
         let default = VideoProcessor::new("in.mp4", "out.mp4");
         assert_eq!(default.output_fps, None);
+    }
+
+    #[test]
+    fn stabilize_smoothing_builder_sets_field() {
+        let p = VideoProcessor::new("in.mp4", "out.mp4").stabilize_smoothing(40);
+        assert_eq!(p.stabilize_smoothing, Some(40));
+        assert_eq!(
+            VideoProcessor::new("in.mp4", "out.mp4").stabilize_smoothing,
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_target_fps_is_none_when_speed_unchanged() -> Result<()> {
+        // Default speed is 1.0, so there is no decimation target.
+        let p = VideoProcessor::new("in.mp4", "out.mp4");
+        assert_eq!(p.resolve_target_fps(&info(3840, 2160, 0))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_target_fps_rejects_invalid_override() {
+        let p = VideoProcessor::new("in.mp4", "out.mp4")
+            .speed(10.0)
+            .output_fps("0");
+        assert!(
+            p.resolve_target_fps(&info(3840, 2160, 0)).is_err(),
+            "an invalid --output-fps must error"
+        );
+    }
+
+    #[test]
+    fn apply_grade_orders_lut_before_dehaze() {
+        // The dehaze must grade the Rec.709 image, i.e. run after the LUT.
+        let p = VideoProcessor::new("in.mp4", "out.mp4")
+            .lut("grade.cube")
+            .dehaze(0.5);
+        let built = p
+            .apply_grade(
+                crate::FFmpegCommand::new("in.mp4", "out.mp4"),
+                &info(3840, 2160, 0),
+                None,
+            )
+            .build();
+        let args: Vec<String> = built
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .expect("expected -filter_complex");
+        let fc = &args[idx + 1];
+        let lut_at = fc.find("lut3d=grade.cube").expect("lut present");
+        let dehaze_at = fc.find("curves=all=").expect("dehaze present");
+        assert!(lut_at < dehaze_at, "lut must precede dehaze: {fc}");
     }
 
     #[test]

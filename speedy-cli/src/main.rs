@@ -70,9 +70,13 @@ struct Args {
     #[arg(short, long)]
     threads: Option<usize>,
 
-    /// Enable video stabilization
+    /// Enable video stabilization (two-pass vidstab; per-segment when stitching)
     #[arg(long)]
     stabilize: bool,
+
+    /// Stabilization smoothing window in frames (higher = glassier glide)
+    #[arg(long, value_name = "FRAMES")]
+    stabilize_smoothing: Option<u32>,
 
     /// Disable auto-rotation based on metadata
     #[arg(long)]
@@ -276,6 +280,12 @@ fn main() -> Result<()> {
 
     if let Some(dehaze) = args.dehaze {
         processor = processor.dehaze(dehaze);
+    }
+
+    if let Some(smoothing) = args.stabilize_smoothing {
+        // The no-op warning lives in VideoProcessor::process, where the
+        // effective stabilization state (after presets) is known.
+        processor = processor.stabilize_smoothing(smoothing);
     }
 
     if let Some(curves) = args.curves {
