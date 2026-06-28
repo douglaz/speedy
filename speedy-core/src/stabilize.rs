@@ -224,7 +224,11 @@ pub fn concat(segments: &[PathBuf], output: &Path) -> Result<()> {
     if segments.iter().any(|s| s.parent() != parent0) {
         bail!("all concat segments must be in the same directory");
     }
-    let dir = parent0.unwrap_or_else(|| Path::new("."));
+    // A bare filename has parent Some(""); current_dir("") fails with ENOENT, so
+    // fall back to "." (the current directory) like work_dir() does.
+    let dir = parent0
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let list = dir.join("concat-list.txt");
     let mut body = String::new();
     for seg in segments {
