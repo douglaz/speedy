@@ -211,7 +211,12 @@ pub fn concat(segments: &[PathBuf], output: &Path) -> Result<()> {
     if segments.is_empty() {
         bail!("no segments to concat");
     }
-    let list = output.with_file_name(format!(".speedy-concat-{}.txt", std::process::id()));
+    // Write the list inside the segments' directory (the caller's unique
+    // per-run temp dir), so concurrent runs don't share a list file.
+    let list = segments[0]
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("concat-list.txt");
     let mut body = String::new();
     for seg in segments {
         // ffconcat single-quoted path: a literal single quote becomes '\''

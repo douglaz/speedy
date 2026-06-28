@@ -281,6 +281,12 @@ impl VideoProcessor {
             if info.has_audio { "yes" } else { "no" }
         );
 
+        // Smoothing only affects the stabilization path; warn if it's a no-op
+        // here, where the effective stabilize state (incl. presets) is known.
+        if self.stabilize_smoothing.is_some() && !self.stabilize {
+            log::warn!("stabilize_smoothing has no effect without stabilization enabled");
+        }
+
         // Stabilization needs a different pipeline (per-clip, two-pass vidstab),
         // so route it out before building the single stitch/grade command.
         if self.stabilize {

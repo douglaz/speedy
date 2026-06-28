@@ -283,11 +283,8 @@ fn main() -> Result<()> {
     }
 
     if let Some(smoothing) = args.stabilize_smoothing {
-        // Smoothing only takes effect on the stabilization path; warn if it
-        // would be a silent no-op (no --stabilize and no preset to enable it).
-        if !args.stabilize && args.preset.is_none() {
-            log::warn!("--stabilize-smoothing has no effect without --stabilize");
-        }
+        // The no-op warning lives in VideoProcessor::process, where the
+        // effective stabilization state (after presets) is known.
         processor = processor.stabilize_smoothing(smoothing);
     }
 
