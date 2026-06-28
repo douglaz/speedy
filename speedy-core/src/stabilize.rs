@@ -45,6 +45,26 @@ impl Default for VidstabParams {
     }
 }
 
+/// Encoder settings for the stabilized output, mirrored from the requested
+/// final encode so `--bitrate`/`--threads` are honored.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeOpts<'a> {
+    pub codec: &'a str,
+    pub quality: u8,
+    pub bitrate: Option<u32>,
+    pub threads: Option<usize>,
+}
+
+/// Escape a filesystem path for embedding as a filtergraph option value, so a
+/// Windows drive path (`C:\...`), backslashes, or quotes are not parsed as
+/// filter syntax. See ffmpeg's notes on filtergraph escaping.
+fn escape_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace(':', "\\:")
+}
+
 /// Count the video frames in a file via ffprobe's `nb_frames`, or `None` when it
 /// is missing/unreadable (e.g. a truncated file from a crashed encode).
 pub fn frame_count(path: &Path) -> Option<u64> {
@@ -74,7 +94,7 @@ pub fn detect(input: &Path, trf: &Path, params: &VidstabParams, attempts: u32) -
         "normalize=smoothing=0,vidstabdetect=shakiness={shakiness}:accuracy={accuracy}:result={trf}",
         shakiness = params.shakiness,
         accuracy = params.accuracy,
-        trf = trf.display(),
+        trf = escape_filter_path(trf),
     );
     for attempt in 1..=attempts {
         if let Err(e) = std::fs::remove_file(trf)
@@ -111,8 +131,7 @@ pub fn transform(
     input: &Path,
     output: &Path,
     trf: &Path,
-    codec: &str,
-    quality: u8,
+    enc: &EncodeOpts,
     params: &VidstabParams,
     attempts: u32,
 ) -> Result<()> {
@@ -123,16 +142,22 @@ pub fn transform(
     let vf = format!(
         "vidstabtransform=input={trf}:smoothing={smoothing}:optzoom=1:interpol=bicubic,\
          unsharp=5:5:0.6:3:3:0.3",
-        trf = trf.display(),
+        trf = escape_filter_path(trf),
         smoothing = params.smoothing,
     );
     for attempt in 1..=attempts {
-        let cmd = FFmpegCommand::new(input, output)
+        let mut cmd = FFmpegCommand::new(input, output)
             .video_filter(&vf)
-            .video_codec(codec)
-            .quality(quality)
+            .video_codec(enc.codec)
+            .quality(enc.quality)
             .video_only()
             .overwrite();
+        if let Some(bitrate) = enc.bitrate {
+            cmd = cmd.bitrate(bitrate);
+        }
+        if let Some(threads) = enc.threads {
+            cmd = cmd.threads(threads);
+        }
         let ran = cmd.execute(|_, _| {});
         let got = frame_count(output);
         if ran.is_ok() && want.is_some() && got == want {
@@ -209,5 +234,16 @@ mod tests {
     fn concat_rejects_empty_segment_list() {
         let r = concat(&[], Path::new("/tmp/out.mp4"));
         assert!(r.is_err(), "empty segment list must error");
+    }
+
+    #[test]
+    fn escape_filter_path_escapes_colon_and_backslash() {
+        let p = escape_filter_path(Path::new("C:\\tmp\\x.trf"));
+        // Raw "C:" would be parsed as a filter option boundary; it must be escaped.
+        assert!(!p.contains("C:"), "colon must be escaped: {p}");
+        assert!(p.contains("C\\:"), "expected escaped colon: {p}");
+        assert!(p.contains("\\\\tmp"), "expected escaped backslash: {p}");
+        // A clean POSIX path is unchanged.
+        assert_eq!(escape_filter_path(Path::new("/tmp/x.trf")), "/tmp/x.trf");
     }
 }

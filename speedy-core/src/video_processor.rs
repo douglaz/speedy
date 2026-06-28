@@ -565,19 +565,31 @@ impl VideoProcessor {
         target_fps: Option<&str>,
         inter_q: u8,
     ) -> Result<()> {
+        // Final-encode settings, mirrored so --bitrate/--threads are honored.
+        let enc = stabilize::EncodeOpts {
+            codec: &self.codec,
+            quality: self.quality,
+            bitrate: self.bitrate,
+            threads: self.threads,
+        };
+        // Matroska intermediates accept every codec speedy supports (incl.
+        // ProRes/VP9/AV1), unlike an `.mp4` intermediate.
         if self.inputs.len() == 1 {
             log::info!(
                 "Stabilizing (two-pass vidstab, smoothing={})",
                 params.smoothing
             );
-            let graded = tmp.join("graded_0.mp4");
+            let graded = tmp.join("graded_0.mkv");
             let mut clip_info = info.clone();
             clip_info.has_audio = false;
-            let cmd = FFmpegCommand::new(&self.inputs[0], &graded)
+            let mut cmd = FFmpegCommand::new(&self.inputs[0], &graded)
                 .video_codec(&self.codec)
                 .quality(inter_q)
                 .video_only()
                 .overwrite();
+            if let Some(threads) = self.threads {
+                cmd = cmd.threads(threads);
+            }
             self.apply_grade(cmd, &clip_info, target_fps)
                 .execute(|_, _| {})?;
             let trf = tmp.join("t_0.trf");
@@ -586,8 +598,7 @@ impl VideoProcessor {
                 &graded,
                 &self.output_path,
                 &trf,
-                &self.codec,
-                self.quality,
+                &enc,
                 params,
                 RETRY_ATTEMPTS,
             )?;
@@ -625,27 +636,22 @@ impl VideoProcessor {
             );
             let mut clip_info = infos[i].clone();
             clip_info.has_audio = false;
-            let graded = tmp.join(format!("graded_{i}.mp4"));
-            let cmd = FFmpegCommand::new(clip, &graded)
+            let graded = tmp.join(format!("graded_{i}.mkv"));
+            let mut cmd = FFmpegCommand::new(clip, &graded)
                 .video_codec(&self.codec)
                 .quality(inter_q)
                 .video_only()
                 .overwrite()
                 .scale_pad(width, height);
+            if let Some(threads) = self.threads {
+                cmd = cmd.threads(threads);
+            }
             self.apply_grade(cmd, &clip_info, target_fps)
                 .execute(|_, _| {})?;
             let trf = tmp.join(format!("t_{i}.trf"));
             stabilize::detect(&graded, &trf, params, RETRY_ATTEMPTS)?;
-            let stab = tmp.join(format!("stab_{i}.mp4"));
-            stabilize::transform(
-                &graded,
-                &stab,
-                &trf,
-                &self.codec,
-                self.quality,
-                params,
-                RETRY_ATTEMPTS,
-            )?;
+            let stab = tmp.join(format!("stab_{i}.mkv"));
+            stabilize::transform(&graded, &stab, &trf, &enc, params, RETRY_ATTEMPTS)?;
             segments.push(stab);
         }
         stabilize::concat(&segments, &self.output_path)
