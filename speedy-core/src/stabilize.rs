@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::FFmpegCommand;
+use crate::ffmpeg_wrapper::is_mp4_family;
 
 /// Tunables for the two `vidstab` passes.
 #[derive(Debug, Clone, Copy)]
@@ -207,41 +208,59 @@ pub fn transform(
 
 /// Concatenate already-encoded segments (same codec/params) without re-encoding,
 /// via ffmpeg's concat demuxer.
+///
+/// ffmpeg runs from the segments' directory and references each by filename, so
+/// segment/list paths (which may sit under a TMPDIR with spaces, quotes,
+/// backslashes, or non-UTF-8 bytes) never need ffconcat escaping. The list lives
+/// in that same per-run temp dir, so concurrent runs don't share it. The output
+/// is absolutized so the working-directory change can't redirect it.
 pub fn concat(segments: &[PathBuf], output: &Path) -> Result<()> {
     if segments.is_empty() {
         bail!("no segments to concat");
     }
-    // Write the list inside the segments' directory (the caller's unique
-    // per-run temp dir), so concurrent runs don't share a list file.
-    let list = segments[0]
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("concat-list.txt");
+    // We reference segments by filename and run from one directory, so they must
+    // all live in it; otherwise a basename could resolve to the wrong file.
+    let parent0 = segments[0].parent();
+    if segments.iter().any(|s| s.parent() != parent0) {
+        bail!("all concat segments must be in the same directory");
+    }
+    // A bare filename has parent Some(""); current_dir("") fails with ENOENT, so
+    // fall back to "." (the current directory) like work_dir() does.
+    let dir = parent0
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let list = dir.join("concat-list.txt");
     let mut body = String::new();
     for seg in segments {
-        // ffconcat single-quoted path: a literal single quote becomes '\''
-        // (close, escaped quote, reopen). Backslashes are literal inside quotes,
-        // so a TMPDIR with quotes/backslashes can't break the list syntax.
-        let escaped = seg.to_string_lossy().replace('\'', "'\\''");
-        body.push_str(&format!("file '{escaped}'\n"));
+        let name = seg
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| seg.to_string_lossy().into_owned());
+        body.push_str(&format!("file '{name}'\n"));
     }
-    std::fs::write(&list, body)?;
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-        ])
-        .arg(&list)
-        .args(["-c", "copy", "-movflags", "+faststart"])
-        .arg(output)
-        .status();
+    std::fs::write(&list, &body)?;
+
+    let output_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
+    let mut cmd = Command::new("ffmpeg");
+    cmd.current_dir(dir).args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        "concat-list.txt",
+        "-c",
+        "copy",
+    ]);
+    // -movflags +faststart is MP4/MOV-only; skip it for other containers.
+    if is_mp4_family(&output_abs) {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    let status = cmd.arg(&output_abs).status();
     if let Err(e) = std::fs::remove_file(&list) {
         log::debug!(
             "could not remove concat list {list}: {e}",
@@ -273,6 +292,13 @@ mod tests {
     fn concat_rejects_empty_segment_list() {
         let r = concat(&[], Path::new("/tmp/out.mp4"));
         assert!(r.is_err(), "empty segment list must error");
+    }
+
+    #[test]
+    fn concat_rejects_segments_from_different_dirs() {
+        // Referencing by basename from one dir would resolve the wrong file.
+        let segs = vec![PathBuf::from("/a/x.mkv"), PathBuf::from("/b/y.mkv")];
+        assert!(concat(&segs, Path::new("/tmp/out.mp4")).is_err());
     }
 
     #[test]

@@ -222,8 +222,12 @@ impl VideoProcessor {
                     highlights[1],
                     highlights[2],
                 ));
+                return self;
             }
         }
+        log::warn!(
+            "Ignoring malformed --color-balance {balance_str:?}; expected \"rs:gs:bs,rm:gm:bm,rh:gh:bh\""
+        );
         self
     }
 
@@ -262,6 +266,10 @@ impl VideoProcessor {
         if self.inputs.is_empty() {
             anyhow::bail!("No input files provided");
         }
+
+        // Reject a speed that would produce garbage or hang: setpts=inf and an
+        // infinite atempo chaining loop for 0 / negative / non-finite speeds.
+        validate_speed(self.speed_multiplier)?;
 
         // Check FFmpeg availability
         let ffmpeg_version = check_ffmpeg()?;
@@ -307,7 +315,7 @@ impl VideoProcessor {
             // upscaled; clips of other sizes are scaled to fit and padded.
             let (width, height) = infos
                 .iter()
-                .map(display_dimensions)
+                .map(|i| target_dimensions(i, self.auto_rotate))
                 .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
                 .unwrap_or((info.width, info.height));
             log::info!(
@@ -328,11 +336,14 @@ impl VideoProcessor {
         };
 
         // Build FFmpeg command. In stitch mode all inputs are passed together;
-        // otherwise just the single clip.
+        // otherwise just the single clip. Use absolute input/output paths so the
+        // LUT working-directory trick (see apply_grade) can't redirect them.
+        let abs_inputs: Vec<PathBuf> = self.inputs.iter().map(|p| absolutize(p)).collect();
+        let abs_output = absolutize(&self.output_path);
         let mut cmd = if stitch_plan.is_some() {
-            FFmpegCommand::new_multi(self.inputs.clone(), &self.output_path)
+            FFmpegCommand::new_multi(abs_inputs, &abs_output)
         } else {
-            FFmpegCommand::new(&self.inputs[0], &self.output_path)
+            FFmpegCommand::new(&abs_inputs[0], &abs_output)
         }
         .video_codec(&self.codec)
         .quality(self.quality)
@@ -450,16 +461,29 @@ impl VideoProcessor {
             cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps);
         }
 
-        // LUT (explicit, else from the colour profile).
-        if let Some(ref lut) = self.lut_file {
-            cmd = cmd.lut3d(lut);
-        } else if let Some(profile_lut) = self.get_profile_lut() {
-            log::info!(
-                "Applying {} profile LUT: {}",
-                self.profile.to_string(),
-                profile_lut.display()
-            );
-            cmd = cmd.lut3d(profile_lut);
+        // LUT (explicit, else from the colour profile). Run ffmpeg from the
+        // LUT's directory and reference it by basename, so a path with
+        // colons/backslashes/commas (Windows drives, odd dirs) isn't mis-parsed
+        // as filtergraph syntax. Input/output paths are absolute, so changing
+        // the working directory is safe.
+        let lut = self.lut_file.clone().or_else(|| self.get_profile_lut());
+        if let Some(lut) = lut {
+            if self.lut_file.is_none() {
+                log::info!(
+                    "Applying {} profile LUT: {}",
+                    self.profile.to_string(),
+                    lut.display()
+                );
+            }
+            match (
+                lut.parent().filter(|p| !p.as_os_str().is_empty()),
+                lut.file_name(),
+            ) {
+                (Some(parent), Some(name)) => {
+                    cmd = cmd.current_dir(absolutize(parent)).lut3d(name);
+                }
+                _ => cmd = cmd.lut3d(&lut),
+            }
         }
 
         // Dehaze (after the LUT, so it grades the Rec.709 image).
@@ -475,16 +499,12 @@ impl VideoProcessor {
             cmd = cmd.color_enhance(self.contrast, self.saturation);
         }
 
-        // Rotation: auto by default, else manual from metadata.
-        if self.auto_rotate {
-            cmd = cmd.auto_rotate();
-        } else if info.rotation != 0 {
-            match info.rotation {
-                90 => cmd = cmd.rotate(1),
-                -90 | 270 => cmd = cmd.rotate(0),
-                180 => cmd = cmd.rotate(2),
-                _ => {}
-            }
+        // Rotation: ffmpeg autorotates by default. `--no-auto-rotate` disables
+        // that (`-noautorotate`) so footage keeps its stored orientation. We do
+        // NOT also transpose — that double-rotated, because autorotation stayed
+        // active.
+        if !self.auto_rotate {
+            cmd = cmd.disable_autorotate();
         }
 
         if let Some(strength) = self.denoise {
@@ -513,16 +533,11 @@ impl VideoProcessor {
             cmd = cmd.selective_color(selective);
         }
         if let Some(ref scale_str) = self.scale {
-            if let Some((width_str, height_str)) = scale_str.split_once('x') {
-                if let Ok(width) = width_str.parse::<i32>() {
-                    let height = height_str.parse::<i32>().unwrap_or(-1);
-                    cmd = cmd.scale(width, height);
-                }
-            } else if let Some((width_str, height_str)) = scale_str.split_once(':')
-                && let Ok(width) = width_str.parse::<i32>()
-            {
-                let height = height_str.parse::<i32>().unwrap_or(-1);
-                cmd = cmd.scale(width, height);
+            match parse_scale(scale_str) {
+                Some((width, height)) => cmd = cmd.scale(width, height),
+                None => log::warn!(
+                    "Ignoring malformed --scale {scale_str:?}; expected e.g. \"1920x1080\" or \"1920:-1\""
+                ),
             }
         }
         cmd
@@ -599,7 +614,7 @@ impl VideoProcessor {
             let graded = tmp.join("graded_0.mkv");
             let mut clip_info = info.clone();
             clip_info.has_audio = false;
-            let mut cmd = FFmpegCommand::new(&self.inputs[0], &graded)
+            let mut cmd = FFmpegCommand::new(absolutize(&self.inputs[0]), &graded)
                 .video_codec(&self.codec)
                 .quality(inter_q)
                 .video_only()
@@ -630,7 +645,7 @@ impl VideoProcessor {
             .collect::<Result<Vec<_>>>()?;
         let (width, height) = infos
             .iter()
-            .map(display_dimensions)
+            .map(|i| target_dimensions(i, self.auto_rotate))
             .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
             .unwrap_or((info.width, info.height));
         log::info!(
@@ -657,7 +672,7 @@ impl VideoProcessor {
             let mut clip_info = infos[i].clone();
             clip_info.has_audio = false;
             let graded = tmp.join(format!("graded_{i}.mkv"));
-            let mut cmd = FFmpegCommand::new(clip, &graded)
+            let mut cmd = FFmpegCommand::new(absolutize(clip), &graded)
                 .video_codec(&self.codec)
                 .quality(inter_q)
                 .video_only()
@@ -758,11 +773,52 @@ fn fps_string_value(s: &str) -> Option<f64> {
     }
 }
 
+/// Make a path absolute (without requiring it to exist), falling back to the
+/// path as-is. Lets us change ffmpeg's working directory for the LUT/vidstab
+/// path tricks without redirecting relative input/output paths.
+fn absolutize(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Validate a speed multiplier. `1.0` (no-op) is fine; otherwise it must be
+/// finite and positive, or `setpts` becomes inf/NaN and the audio `atempo`
+/// chaining loop can spin forever.
+fn validate_speed(multiplier: f64) -> Result<()> {
+    if multiplier != 1.0 && (!multiplier.is_finite() || multiplier <= 0.0) {
+        anyhow::bail!("Invalid speed {multiplier}; must be a positive, finite number");
+    }
+    Ok(())
+}
+
+/// Parse a `--scale` spec (`"WxH"` or `"W:H"`; `-1` = auto height). Returns
+/// `None` for malformed input so the caller can warn instead of silently
+/// dropping it.
+fn parse_scale(spec: &str) -> Option<(i32, i32)> {
+    let (w, h) = spec.split_once('x').or_else(|| spec.split_once(':'))?;
+    let width: i32 = w.trim().parse().ok()?;
+    // -1 (auto) is valid and parses fine; a non-numeric height is malformed.
+    let height: i32 = h.trim().parse().ok()?;
+    Some((width, height))
+}
+
 /// Display dimensions of a clip, accounting for a 90°/270° rotation flag
 /// (cameras often store rotated footage with a rotation tag).
 fn display_dimensions(info: &crate::VideoInfo) -> (u32, u32) {
     if info.rotation.abs() % 180 == 90 {
         (info.height, info.width)
+    } else {
+        (info.width, info.height)
+    }
+}
+
+/// The frame size the scale/pad target should match for stitching. With
+/// autorotation on (default), filters see the rotated display frame, so use
+/// display dimensions. With `--no-auto-rotate`, ffmpeg keeps the stored frame,
+/// so use the stored dimensions — otherwise a rotated clip is scaled/padded into
+/// a swapped canvas and comes out sideways and letterboxed.
+fn target_dimensions(info: &crate::VideoInfo, auto_rotate: bool) -> (u32, u32) {
+    if auto_rotate {
+        display_dimensions(info)
     } else {
         (info.width, info.height)
     }
@@ -887,9 +943,48 @@ mod tests {
             .position(|a| a == "-filter_complex")
             .expect("expected -filter_complex");
         let fc = &args[idx + 1];
-        let lut_at = fc.find("lut3d=grade.cube").expect("lut present");
+        let lut_at = fc.find("lut3d=file='grade.cube'").expect("lut present");
         let dehaze_at = fc.find("curves=all=").expect("dehaze present");
         assert!(lut_at < dehaze_at, "lut must precede dehaze: {fc}");
+    }
+
+    #[test]
+    fn target_dimensions_uses_stored_dims_when_autorotate_off() {
+        // -90 clip: stored portrait 3384x6016, displays landscape 6016x3384.
+        let rotated = info(3384, 6016, -90);
+        assert_eq!(target_dimensions(&rotated, true), (6016, 3384)); // display
+        assert_eq!(target_dimensions(&rotated, false), (3384, 6016)); // stored
+        // Unrotated clip is identical either way.
+        let upright = info(3840, 2160, 0);
+        assert_eq!(target_dimensions(&upright, true), (3840, 2160));
+        assert_eq!(target_dimensions(&upright, false), (3840, 2160));
+    }
+
+    #[test]
+    fn validate_speed_accepts_positive_finite_rejects_bad() {
+        for ok in [1.0, 2.0, 0.5, 10.0] {
+            assert!(validate_speed(ok).is_ok(), "{ok} should be ok");
+        }
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(validate_speed(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_scale_parses_and_rejects() {
+        assert_eq!(parse_scale("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_scale("1920:-1"), Some((1920, -1)));
+        assert_eq!(parse_scale("1280x-1"), Some((1280, -1)));
+        // No separator, or a non-numeric width/height: malformed.
+        assert_eq!(parse_scale("1920"), None);
+        assert_eq!(parse_scale("axb"), None);
+        assert_eq!(parse_scale("1920xabc"), None);
+    }
+
+    #[test]
+    fn absolutize_makes_relative_paths_absolute() {
+        // A relative path becomes absolute (joined with cwd); cross-platform.
+        assert!(absolutize(Path::new("rel/x.mp4")).is_absolute());
     }
 
     #[test]
