@@ -528,6 +528,11 @@ impl VideoProcessor {
     /// brightness-normalized copy so exposure (EV) changes don't induce shake.
     /// Stabilized output is video-only.
     fn process_stabilized(&self, info: &crate::VideoInfo) -> Result<()> {
+        if self.hw_accel {
+            log::warn!(
+                "--hw-accel is not applied on the stabilization path; grade/detect/transform use the software codec"
+            );
+        }
         let params = VidstabParams {
             smoothing: self
                 .stabilize_smoothing
@@ -539,7 +544,13 @@ impl VideoProcessor {
         // warp does not visibly degrade the grade.
         let inter_q = self.quality.min(16);
 
-        let tmp = std::env::temp_dir().join(format!("speedy-stab-{}", std::process::id()));
+        // Unique per-call temp dir: the pid alone collides across concurrent
+        // VideoProcessor runs in one process, which would clobber intermediates.
+        let nonce = STAB_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "speedy-stab-{pid}-{nonce}",
+            pid = std::process::id()
+        ));
         std::fs::create_dir_all(&tmp)
             .with_context(|| format!("Failed to create temp dir {}", tmp.display()))?;
 
@@ -665,6 +676,10 @@ impl VideoProcessor {
 /// `vidstab`/encoder crashes can be intermittent, leaving a truncated file; we
 /// retry until the pass validates rather than trusting one exit code.
 const RETRY_ATTEMPTS: u32 = 6;
+
+/// Per-process counter making each stabilization run's temp dir unique, so
+/// concurrent `process()` calls in one process don't clobber each other.
+static STAB_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Probe the first *video* stream's base frame rate (`r_frame_rate`) as an
 /// ffmpeg-ready string (e.g. `"30000/1001"`). Falls back to the formatted
