@@ -43,8 +43,17 @@ This project is a Rust workspace with two crates:
   - Color balance across shadows, midtones, and highlights
   - Selective color adjustments
   - Hue shifting
-- **Enhancement & cleanup** — video stabilization (`deshake`), denoising
-  (`nlmeans`), and sharpening (`unsharp`).
+- **Stabilization** (`--stabilize`) — two-pass `vidstab` (detect + transform),
+  not the weaker single-pass `deshake`. Two refinements for real-world footage:
+  - **Per-segment when stitching** — each clip is stabilized independently
+    before concatenation, so smoothing never crosses a cut (no artificial pan at
+    clip boundaries).
+  - **Brightness-normalized detection** — motion is detected on a normalized
+    copy, so a sudden exposure (EV) change isn't misread as camera motion (which
+    would otherwise inject a shake the moment the exposure shifts).
+  - Tune the glide with `--stabilize-smoothing <frames>`. Stabilized output is
+    video-only.
+- **Enhancement & cleanup** — denoising (`nlmeans`) and sharpening (`unsharp`).
 - **Encoding control** — codec (H.264, H.265/HEVC, VP9, AV1, ProRes), CRF
   quality, target bitrate, thread count, and output scaling.
 - **Hardware acceleration** — optional, using the best method per platform
@@ -145,6 +154,12 @@ speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 # warning otherwise); or grade with your own via `--lut /path/to/your.cube`.
 speedy -i /path/to/DCIM/DJI_001 \
   --profile d-log --speed 10 --codec h265 -o combined_10x.mp4
+
+# The full drone pipeline: stitch + D-Log LUT + dehaze + 10× + per-segment
+# stabilization, in one command. Each clip is graded and stabilized on its own
+# before joining, so the stabilizer never invents a pan across a cut.
+speedy -i /path/to/DCIM/DJI_001 \
+  --profile d-log --speed 10 --dehaze 0.2 --stabilize -o combined_10x.mp4
 ```
 
 ### Advanced Color Grading
@@ -198,7 +213,8 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `-q, --quality <CRF>` | CRF quality (0–51, lower is better) | `23` |
 | `--hw-accel` | Enable hardware acceleration if available | off |
 | `-t, --threads <N>` | Number of encoding threads | auto |
-| `--stabilize` | Enable video stabilization | off |
+| `--stabilize` | Two-pass vidstab stabilization (per-segment when stitching) | off |
+| `--stabilize-smoothing <FRAMES>` | Stabilization smoothing window (higher = glassier) | `20` |
 | `--no-auto-rotate` | Disable auto-rotation from metadata | off |
 | `--denoise <1-10>` | Denoising strength | — |
 | `--sharpen <0.1-2.0>` | Sharpening strength | — |
