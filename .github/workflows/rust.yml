@@ -26,7 +26,7 @@ jobs:
       # Only cache cargo registry (dependencies), not target directory
       # Target caching conflicts with nix environment and multiple build targets
       - name: Cache Cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -60,7 +60,7 @@ jobs:
             experimental-features = nix-command flakes
       
       - name: Cache Cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -112,7 +112,7 @@ jobs:
           echo "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
       
       - name: Cache Cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
