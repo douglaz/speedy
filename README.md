@@ -52,10 +52,16 @@ This project is a Rust workspace with two crates:
     copy, so a sudden exposure (EV) change isn't misread as camera motion (which
     would otherwise inject a shake the moment the exposure shifts).
   - Tune the glide with `--stabilize-smoothing <frames>`. Stabilized output is
-    video-only.
+    video-only, and 8-bit: the vidstab filters have no 10-bit mode, so ffmpeg
+    converts the image down around them. Use `--no-stabilize` to switch off a
+    preset's stabilization (`mavic4pro-dlog` and `dji` enable it) and keep an
+    H.265 encode 10-bit end to end.
 - **Enhancement & cleanup** — denoising (`nlmeans`) and sharpening (`unsharp`).
 - **Encoding control** — codec (H.264, H.265/HEVC, VP9, AV1, ProRes), CRF
-  quality, target bitrate, thread count, and output scaling.
+  quality, target bitrate, thread count, and output scaling. `libx265` encodes
+  10-bit (Main 10) and ProRes 10-bit 4:2:2, so a log source graded through a LUT
+  keeps its gradients instead of banding in dark skies; the other codecs are
+  8-bit.
 - **Hardware acceleration** — optional, using the best method per platform
   (VAAPI on Linux, VideoToolbox on macOS, DXVA2 on Windows).
 - **Auto-rotation** — honors rotation metadata by default; disable with
@@ -214,6 +220,7 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `--hw-accel` | Enable hardware acceleration if available | off |
 | `-t, --threads <N>` | Number of encoding threads | auto |
 | `--stabilize` | Two-pass vidstab stabilization (per-segment when stitching) | off |
+| `--no-stabilize` | Turn stabilization off, including a preset's | off |
 | `--stabilize-smoothing <FRAMES>` | Stabilization smoothing window (higher = glassier) | `20` |
 | `--no-auto-rotate` | Disable auto-rotation from metadata | off |
 | `--denoise <1-10>` | Denoising strength | — |
