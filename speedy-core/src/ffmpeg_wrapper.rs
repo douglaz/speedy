@@ -432,12 +432,21 @@ impl FFmpegCommand {
     }
 
     /// Pixel format the filtered stream is normalized to before encoding.
-    /// ProRes needs 10-bit 4:2:2; web codecs (H.264/H.265/VP9/AV1) use 8-bit
-    /// 4:2:0. This is what converts the RGB output of filters like lut3d back to
-    /// something the encoder accepts.
+    /// ProRes needs 10-bit 4:2:2. x265 gets 10-bit 4:2:0 (Main 10, which it
+    /// selects from the pixel format): log sources are 10-bit, and squeezing the
+    /// LUT's output back to 8 bits bands visibly in the smooth dark gradients of
+    /// night footage. Other web codecs (H.264/VP9/AV1) use 8-bit 4:2:0. Only
+    /// `libx265` is widened — the hardware HEVC encoders (`hevc_vaapi`,
+    /// `hevc_videotoolbox`) take their own surface formats. This is what converts
+    /// the RGB output of filters like lut3d back to something the encoder accepts.
+    ///
+    /// Note: `--stabilize` still narrows the image to 8 bits, because the vidstab
+    /// filters are 8-bit only and ffmpeg auto-inserts the conversion around them.
+    /// Only an unstabilized run keeps 10 bits end to end.
     fn output_pixel_format(&self) -> &'static str {
         match self.video_codec.as_deref() {
             Some(codec) if codec.contains("prores") => "yuv422p10le",
+            Some(codec) if codec.contains("x265") => "yuv420p10le",
             _ => "yuv420p",
         }
     }
@@ -918,6 +927,30 @@ mod tests {
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert!(fc.ends_with("format=yuv422p10le[v]"), "fc: {fc}");
+        Ok(())
+    }
+
+    #[test]
+    fn x265_keeps_10bit_pixel_format_but_other_hevc_encoders_do_not() -> Result<()> {
+        // A 10-bit log source graded through a LUT bands in 8 bits; x265 reads
+        // Main 10 off the pixel format. Hardware HEVC encoders must stay 8-bit.
+        let fc_of = |codec: &str| -> Result<String> {
+            let args = args_of(
+                &FFmpegCommand::new("in.mp4", "out.mp4")
+                    .video_codec(codec)
+                    .lut3d("grade.cube")
+                    .build(),
+            );
+            filter_complex(&args)
+                .context("expected -filter_complex")
+                .cloned()
+        };
+        let x265 = fc_of("libx265")?;
+        assert!(x265.ends_with("format=yuv420p10le[v]"), "fc: {x265}");
+        for eight_bit in ["libx264", "libvpx-vp9", "hevc_vaapi", "hevc_videotoolbox"] {
+            let fc = fc_of(eight_bit)?;
+            assert!(fc.ends_with("format=yuv420p[v]"), "{eight_bit} fc: {fc}");
+        }
         Ok(())
     }
 

@@ -74,6 +74,11 @@ struct Args {
     #[arg(long)]
     stabilize: bool,
 
+    /// Disable stabilization, overriding a preset that enables it (e.g.
+    /// mavic4pro-dlog). Keeps the image 10-bit, which vidstab cannot.
+    #[arg(long, conflicts_with = "stabilize")]
+    no_stabilize: bool,
+
     /// Stabilization smoothing window in frames (higher = glassier glide)
     #[arg(long, value_name = "FRAMES")]
     stabilize_smoothing: Option<u32>,
@@ -249,6 +254,11 @@ fn main() -> Result<()> {
     }
     if !preset_used || explicit("stabilize") {
         processor = processor.stabilize(args.stabilize);
+    }
+    // --no-stabilize is the only way to switch a preset's stabilization back off,
+    // since the `--stabilize` flag's default is indistinguishable from "unset".
+    if args.no_stabilize {
+        processor = processor.stabilize(false);
     }
     if !preset_used || explicit("no_auto_rotate") {
         processor = processor.auto_rotate(!args.no_auto_rotate);
