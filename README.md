@@ -186,9 +186,9 @@ nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --profile d-log
 nix develop -c ./result/bin/speedy -i /path/to/DCIM/DJI_001 -o hyperlapse_hdr.mp4 \
   --input-color dji-dlog --speed 10 --scale 3840:-2
 
-# Grade in ACES: +0.5 stop, a little contrast and saturation
+# Grade in ACES: 1 stop (0.3 over the default), a little contrast and saturation
 nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
-  --exposure 0.5 --contrast 1.1 --saturation 1.1
+  --exposure 1.0 --contrast 1.1 --saturation 1.1
 
 # A creative LUT that works on ACEScct values (in and out)
 nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
@@ -206,7 +206,9 @@ What HDR output does and allows:
   bitstream, whatever the source was tagged. `.mp4` is the tested container.
   `--codec` may be `h265`, `hevc` or `libx265`; any other codec, including the
   hardware HEVC encoders, is an error.
-- **Grade** — `--exposure <STOPS>` (−3 to 3, a linear gain in ACEScg),
+- **Grade** — `--exposure <STOPS>` (−3 to 3, a linear gain in ACEScg; default
+  0.7, which lifts 18% grey from the ~30% HLG signal the ACES 2.0 rendering
+  gives it to the 38% HLG reference level; a value you pass replaces it),
   `--contrast` (0.3–2.0, around 18% grey in ACEScct), `--saturation` (0.0–2.0,
   in ACEScct), and `--lut` with `--lut-space acescct`.
 - **Still available** — speed, `--output-fps`, stitching, `--scale` (applied
@@ -309,7 +311,7 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `--input-color <COLOR>` | Source encoding: `standard`, `dji-dlog`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
 | `-p, --profile <PROFILE>` | Older spelling of `--input-color` (`d-log` = `dji-dlog`); the two cannot be combined | `standard` |
 | `--output-color <COLOR>` | `rec709` (SDR) or `hlg` (HDR, Rec.2100 HLG) | `hlg` for D-Log input without a preset, else `rec709` |
-| `--exposure <STOPS>` | Exposure in stops (−3 to 3), in ACEScg (HDR output only) | — |
+| `--exposure <STOPS>` | Exposure in stops (−3 to 3), in ACEScg (HDR output only) | `0.7` (HDR) |
 | `-c, --contrast <V>` | Contrast (0.0–2.0; HDR: 0.3–2.0, in ACEScct) | `1.0` |
 | `-S, --saturation <V>` | Saturation (0.0–2.0; HDR: in ACEScct) | `1.0` |
 | `--codec <CODEC>` | `h264`, `h265`/`hevc`, `vp9`, `av1`, `prores` (HDR: `h265` only) | `h264` (HDR: `h265`) |

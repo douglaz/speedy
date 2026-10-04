@@ -73,7 +73,8 @@ struct Args {
     output_color: Option<OutputColor>,
 
     /// Exposure compensation in stops (-3 to 3), applied in ACEScg linear
-    /// light. HDR output only.
+    /// light. HDR output only; defaults to 0.7, which puts 18% grey at the
+    /// HLG reference level. A value given here replaces the default.
     #[arg(long, value_name = "STOPS", allow_negative_numbers = true)]
     exposure: Option<f32>,
 
@@ -1060,8 +1061,9 @@ mod tests {
         let (args, dir) = plan(&with(&SINGLE, &["--profile", "d-log"]))?;
         let graph = format!(
             "[0:v]zscale=matrixin=709:rangein=limited:matrix=gbr:range=full,format=gbrpf32le,\
-             ocio=config={QUOTED_CONFIG}:input='D-Log D-Gamut':output='ACEScct':format=gbrpf32le,\
-             ocio=config={QUOTED_CONFIG}:input='ACEScct':display='Rec.2100-HLG - Display':view='ACES 2.0 - HDR 1000 nits (P3 D65)':format=gbrpf32le,\
+             ocio=config={QUOTED_CONFIG}:input='D-Log D-Gamut':output='ACEScg':format=gbrpf32le,\
+             exposure=exposure=0.7000:black=0,\
+             ocio=config={QUOTED_CONFIG}:input='ACEScg':display='Rec.2100-HLG - Display':view='ACES 2.0 - HDR 1000 nits (P3 D65)':format=gbrpf32le,\
              zscale=matrixin=gbr:rangein=full:matrix=2020_ncl:range=limited,format=yuv420p10le,\
              setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc:range=tv,\
              format=yuv420p10le[v]"

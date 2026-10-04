@@ -29,6 +29,12 @@ pub const OCIO_HLG_DISPLAY: &str = "Rec.2100-HLG - Display";
 /// the HLG display (P3-D65 limited gamut inside the Rec.2100 container).
 pub const OCIO_HLG_VIEW: &str = "ACES 2.0 - HDR 1000 nits (P3 D65)";
 
+/// Exposure used on the HDR route when none is given. The ACES 2.0 1000-nit
+/// rendering puts D-Log 18% grey at ~30% HLG signal, about 0.7 stop under the
+/// HLG reference level of 38% (ITU-R BT.2408); this lifts it back so the
+/// default output matches other HLG material, e.g. on YouTube.
+pub const HLG_DEFAULT_EXPOSURE: f32 = 0.7;
+
 /// ACEScct code value of 18% grey, the pivot of the contrast operator.
 const ACESCCT_MID_GREY: f64 = 0.413_588_4;
 /// AP1 luminance weights (R, G, B), used by the saturation operator.
@@ -885,12 +891,11 @@ mod tests {
         let cb = code(2 * (luma_samples + chroma_samples / 2 + 80));
         let cr = code(2 * (luma_samples + chroma_samples + chroma_samples / 2 + 80));
 
-        // The HLG reference puts an 18% grey card at 38% signal. The ACES 2.0
-        // 1000-nit rendering places mid grey lower (about 30%), hence the wide
-        // tolerance: this guards against a broken transform, not a taste call.
+        // The HLG reference puts an 18% grey card at 38% signal; the default
+        // exposure (HLG_DEFAULT_EXPOSURE) exists to land there.
         let signal = (luma - 64.0) / 876.0;
         eprintln!("D-Log 18% grey -> HLG signal {signal:.4} (Y'={luma}, Cb={cb}, Cr={cr})");
-        assert!((signal - 0.38).abs() < 0.12, "HLG mid grey at {signal}");
+        assert!((signal - 0.38).abs() < 0.02, "HLG mid grey at {signal}");
         // A neutral patch must stay neutral.
         assert!((cb - 512.0).abs() <= 2.0 && (cr - 512.0).abs() <= 2.0);
         Ok(())

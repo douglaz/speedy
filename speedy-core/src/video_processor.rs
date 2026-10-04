@@ -719,7 +719,7 @@ impl VideoProcessor {
         };
 
         let grade = HdrGrade {
-            exposure: self.exposure.unwrap_or(0.0),
+            exposure: self.exposure.unwrap_or(color::HLG_DEFAULT_EXPOSURE),
             contrast: self.contrast,
             saturation: self.saturation,
             lut: lut_name.as_deref(),
