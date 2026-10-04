@@ -50,7 +50,7 @@ struct Args {
     lut_space: Option<LutSpace>,
 
     /// Color profile of the source footage (same as --input-color; `d-log` is
-    /// an alias for `dji-dlog`)
+    /// an alias for `dji-dlog`, `d-log-m` for `dji-dlog-m`)
     #[arg(
         short = 'p',
         long,
@@ -676,6 +676,37 @@ mod tests {
             )
         );
         assert_eq!(dir.as_deref(), Some(Path::new("/grades")));
+        Ok(())
+    }
+
+    #[test]
+    fn dlog_m_takes_the_dji_lut_and_stays_rec709() -> Result<()> {
+        let dlog_m = [
+            "-y",
+            "-i",
+            "/clips/a.mp4",
+            "-filter_complex",
+            "[0:v]lut3d=file='dji_dlogm_to_rec709.cube',format=yuv420p[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "23",
+        ];
+        // No --output-color: unlike D-Log, D-Log M has no HDR route to default to.
+        for spelling in [["--profile", "d-log-m"], ["--input-color", "dji-dlog-m"]] {
+            assert_sdr(&spelling, "/out/out.mp4", &expect(&dlog_m, &TAIL_MP4), true)?;
+        }
+        let hdr = error_of(&with(
+            &SINGLE,
+            &["--profile", "d-log-m", "--output-color", "hlg"],
+        ));
+        assert!(hdr.contains("D-Log M input has no HDR route"), "{hdr}");
         Ok(())
     }
 

@@ -24,6 +24,8 @@ Thumbs.db
 # LUT files for testing
 *.cube
 *.3dl
+# ...except the shipped profile conversion LUTs
+!luts/*.cube
 
 # Output files
 output/

@@ -456,6 +456,7 @@ impl VideoProcessor {
     pub fn profile_lut_path(&self) -> Option<PathBuf> {
         let path = match self.color.input {
             InputColor::DjiDLogDGamut => "luts/mavic4_pro_dlog_to_rec709.cube",
+            InputColor::DjiDLogM => "luts/dji_dlogm_to_rec709.cube",
             InputColor::SLog => "luts/sony_slog_to_rec709.cube",
             InputColor::CLog => "luts/canon_clog_to_rec709.cube",
             _ => return None,
