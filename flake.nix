@@ -24,7 +24,9 @@
         };
 
         # FFmpeg with all features for video processing
-        ffmpegFull = pkgs.ffmpeg_7-full.override {
+        # ffmpeg 8 with OpenColorIO: the HDR pipeline needs the `ocio` filter, and
+        # nixpkgs has no switch for it, hence the overrideAttrs.
+        ffmpegFull = (pkgs.ffmpeg_8-full.override {
           withNvcodec = true;  # NVIDIA hardware acceleration
           withVaapi = true;    # VAAPI hardware acceleration
           withVdpau = true;    # VDPAU hardware acceleration
@@ -32,7 +34,10 @@
           withX265 = true;     # H.265/HEVC encoder
           withVpx = true;      # VP8/VP9 encoder
           withAom = true;      # AV1 encoder
-        };
+        }).overrideAttrs (old: {
+          configureFlags = old.configureFlags ++ [ "--enable-libopencolorio" ];
+          buildInputs = old.buildInputs ++ [ pkgs.opencolorio ];
+        });
       in
       {
         # Default package: static musl build
