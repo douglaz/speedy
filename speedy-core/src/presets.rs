@@ -1,4 +1,4 @@
-use crate::{ColorProfile, VideoProcessor};
+use crate::{InputColor, VideoProcessor};
 
 /// Preset configurations for common video processing workflows
 pub enum Preset {
@@ -35,11 +35,14 @@ pub enum Preset {
 impl Preset {
     /// Apply preset to a video processor
     pub fn apply(&self, processor: VideoProcessor) -> VideoProcessor {
+        // Presets are Rec.709 grades; the processor remembers one was applied
+        // so HDR output can refuse it.
+        let processor = processor.mark_preset_applied();
         match self {
             Preset::Mavic4ProDLog => {
                 // DJI Mavic 4 Pro D-Log footage processing with vibrance instead of saturation
                 processor
-                    .profile(ColorProfile::DLog)
+                    .input_color(InputColor::DjiDLogDGamut)
                     .contrast(1.15)
                     .vibrance(0.3) // Use vibrance for more natural color enhancement
                     .auto_rotate(true)
@@ -73,7 +76,7 @@ impl Preset {
             Preset::SonySLog => {
                 // Sony S-Log footage
                 processor
-                    .profile(ColorProfile::SLog)
+                    .input_color(InputColor::SLog)
                     .contrast(1.2)
                     .saturation(1.15)
                     .codec("h265")
@@ -83,7 +86,7 @@ impl Preset {
             Preset::CanonCLog => {
                 // Canon C-Log footage
                 processor
-                    .profile(ColorProfile::CLog)
+                    .input_color(InputColor::CLog)
                     .contrast(1.18)
                     .saturation(1.12)
                     .codec("h265")
