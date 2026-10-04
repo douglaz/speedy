@@ -2,8 +2,9 @@
 
 A fast command-line video processing tool built in Rust on top of the FFmpeg
 CLI. Speedy handles speed changes, multi-clip stitching, LUT-based color
-grading, log-profile conversion, and a full set of color-enhancement filters —
-all driven by a single `speedy` binary.
+grading, log-profile conversion, HDR (Rec.2100 HLG) delivery of DJI D-Log
+footage through ACES, and a full set of color-enhancement filters — all driven
+by a single `speedy` binary.
 
 ## Project Structure
 
@@ -37,10 +38,12 @@ This project is a Rust workspace with two crates:
   This is the default for D-Log input; see [HDR Output](#hdr-output-d-log--hlg).
 - **LUT color grading** — apply a `.cube` 3D LUT with `--lut`.
 - **Log-profile support** — declare the source with `--input-color` (or its
-  older spelling `--profile`) for D-Log, S-Log, C-Log, V-Log, or F-Log footage.
-  On the Rec.709 route, when a matching conversion LUT is present under
-  `luts/` it is applied automatically; if it's missing the conversion is
-  skipped with a warning so other adjustments still run.
+  older spelling `--profile`) for DJI D-Log, DJI D-Log M (e.g. Avata 2), S-Log,
+  C-Log, V-Log, or F-Log footage. On the Rec.709 route the matching conversion
+  LUT under `luts/` is applied automatically. DJI's D-Log (Mavic 4 Pro) and
+  D-Log M LUTs ship with the repository (see [Bundled LUTs](#bundled-luts));
+  for the other profiles, or when `luts/` is not under the working directory,
+  the conversion is skipped with a warning so other adjustments still run.
 - **Color enhancement filters** (Rec.709 output; HDR output takes only
   contrast, saturation, `--exposure` and an ACEScct LUT):
   - Contrast and saturation
@@ -63,7 +66,7 @@ This project is a Rust workspace with two crates:
   - Tune the glide with `--stabilize-smoothing <frames>`. Stabilized output is
     video-only, and 8-bit: the vidstab filters have no 10-bit mode, so ffmpeg
     converts the image down around them. Use `--no-stabilize` to switch off a
-    preset's stabilization (`mavic4pro-dlog` and `dji` enable it) and keep an
+    preset's stabilization (`mavic4pro-dlog`, `dji` and `gopro` enable it) and keep an
     H.265 encode 10-bit end to end. Stabilization is refused with HDR output
     for the same reason.
 - **Enhancement & cleanup** — denoising (`nlmeans`) and sharpening (`unsharp`).
@@ -157,6 +160,9 @@ speedy -i drone_footage.mp4 -o processed.mp4 --preset mavic4pro-dlog
 # Treat the source as S-Log footage (applies the S-Log LUT if available)
 speedy -i clip.mov -o graded.mp4 --input-color s-log
 
+# DJI D-Log M footage (e.g. Avata 2) to Rec.709 through DJI's bundled LUT
+speedy -i DJI_0001.MP4 -o graded.mp4 --profile d-log-m
+
 # DJI D-Log footage to an HDR (Rec.2100 HLG) file for YouTube
 speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog
 ```
@@ -218,7 +224,9 @@ What HDR output does and allows:
   `--no-stabilize`), `--dehaze`, presets, `--curves`, `--vibrance`,
   `--selective-color`, `--hue-shift`, `--color-balance`, `--denoise`,
   `--sharpen`, a `--lut` without `--lut-space acescct`, and any input other
-  than DJI D-Log. These were built for a Rec.709 image; use
+  than DJI D-Log — D-Log M included, since DJI publishes a LUT for it but no
+  curve to build an ACES input transform from. These were built for a Rec.709
+  image; use
   `--output-color rec709` to keep them.
 - **Source tags** — the source's YUV matrix and range tags drive the
   conversion to RGB. Untagged sources are read as BT.709, limited range (logged
@@ -248,10 +256,9 @@ speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 # Stitch a folder of DJI D-Log clips into a 10× Rec.709 hyperlapse. The
 # speed-up decimates frames back to the source fps, so the output is a short,
 # normal-frame-rate clip (not a ~300 fps file). With `--output-color rec709`,
-# `--profile d-log` auto-applies the bundled D-Log LUT when one is present
-# under luts/ (and is skipped with a warning otherwise); or grade with your own
-# via `--lut /path/to/your.cube`. Without `--output-color rec709` this would be
-# an HDR job (see "HDR Output").
+# `--profile d-log` auto-applies the bundled D-Log LUT from luts/; or grade
+# with your own via `--lut /path/to/your.cube`. Without `--output-color rec709`
+# this would be an HDR job (see "HDR Output").
 speedy -i /path/to/DCIM/DJI_001 \
   --profile d-log --output-color rec709 --speed 10 --codec h265 -o combined_10x.mp4
 
@@ -308,8 +315,8 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `--output-fps <FPS>` | Output frame rate for speed changes (e.g. `30`, `30000/1001`) | source fps |
 | `-l, --lut <FILE>` | `.cube` LUT for color grading (HDR: needs `--lut-space acescct`) | — |
 | `--lut-space <SPACE>` | Color space the LUT works in: `acescct` (HDR output only) | — |
-| `--input-color <COLOR>` | Source encoding: `standard`, `dji-dlog`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
-| `-p, --profile <PROFILE>` | Older spelling of `--input-color` (`d-log` = `dji-dlog`); the two cannot be combined | `standard` |
+| `--input-color <COLOR>` | Source encoding: `standard`, `dji-dlog`, `dji-dlog-m`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
+| `-p, --profile <PROFILE>` | Older spelling of `--input-color` (`d-log` = `dji-dlog`, `d-log-m` = `dji-dlog-m`); the two cannot be combined | `standard` |
 | `--output-color <COLOR>` | `rec709` (SDR) or `hlg` (HDR, Rec.2100 HLG) | `hlg` for D-Log input without a preset, else `rec709` |
 | `--exposure <STOPS>` | Exposure in stops (−3 to 3), in ACEScg (HDR output only) | `0.7` (HDR) |
 | `-c, --contrast <V>` | Contrast (0.0–2.0; HDR: 0.3–2.0, in ACEScct) | `1.0` |
@@ -344,6 +351,19 @@ The flags from `--stabilize` down to `--selective-color` in the table (except
 `--no-stabilize` and `--no-auto-rotate`) are likewise Rec.709-only.
 
 Run `speedy --help` for the authoritative, always-current list.
+
+### Bundled LUTs
+
+`luts/` holds DJI's official Rec.709 conversion LUTs, unmodified, from DJI's
+download center:
+
+| Profile | File | DJI download |
+| --- | --- | --- |
+| `d-log` | `luts/mavic4_pro_dlog_to_rec709.cube` | DJI Mavic 4 Pro D-Log to Rec.709 V1 |
+| `d-log-m` | `luts/dji_dlogm_to_rec709.cube` | DJI Avata 2 D-Log M to Rec.709 V1 (the same file DJI ships for the Mini 4 Pro and Mavic 3 Pro) |
+
+The path is relative to the working directory, so run speedy from the
+repository root (or keep a `luts/` folder next to where you run it).
 
 ### Available Presets
 
@@ -419,6 +439,7 @@ nix develop -c cargo fmt --check && nix develop -c cargo clippy --workspace -- -
 speedy/
 ├── Cargo.toml            # Workspace configuration
 ├── flake.nix             # Nix flake (static build + dev shell)
+├── luts/                 # DJI's Rec.709 conversion LUTs (D-Log, D-Log M)
 ├── speedy-core/          # Core library
 │   ├── Cargo.toml
 │   └── src/

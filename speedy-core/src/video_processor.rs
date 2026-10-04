@@ -423,10 +423,10 @@ impl VideoProcessor {
 
     /// Get the appropriate LUT file for the color profile, if one is available.
     ///
-    /// A missing profile LUT is not fatal: the LUT assets are not shipped with
-    /// the repository (they are git-ignored), so we log a warning and skip the
-    /// color conversion rather than aborting, letting the other preset
-    /// adjustments still apply.
+    /// A missing profile LUT is not fatal: only the DJI LUTs ship in `luts/`,
+    /// and the path is relative to the working directory, so we log a warning
+    /// and skip the color conversion rather than aborting, letting the other
+    /// preset adjustments still apply.
     fn get_profile_lut(&self) -> Option<PathBuf> {
         let lut_path = self.profile_lut_path()?;
         if lut_path.exists() {
