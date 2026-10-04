@@ -49,6 +49,10 @@ pub enum InputColor {
     /// DJI D-Log / D-Gamut (the only input with an HDR route)
     #[value(name = "dji-dlog", alias = "d-log")]
     DjiDLogDGamut,
+    /// DJI D-Log M, e.g. Avata 2 (Rec.709 route only: DJI publishes a LUT but
+    /// no curve to build an ACES input transform from)
+    #[value(name = "dji-dlog-m", alias = "d-log-m")]
+    DjiDLogM,
     /// Sony S-Log (Rec.709 route only)
     SLog,
     /// Canon C-Log (Rec.709 route only)
@@ -64,6 +68,7 @@ impl InputColor {
         match self {
             InputColor::Standard => "Standard",
             InputColor::DjiDLogDGamut => "D-Log",
+            InputColor::DjiDLogM => "D-Log M",
             InputColor::SLog => "S-Log",
             InputColor::CLog => "C-Log",
             InputColor::VLog => "V-Log",
