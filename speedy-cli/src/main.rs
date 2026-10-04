@@ -526,9 +526,22 @@ mod tests {
             .build();
         let args = command
             .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
+            .map(|a| unix_style(a.to_string_lossy().into_owned()))
             .collect();
-        Ok((args, command.get_current_dir().map(Path::to_path_buf)))
+        let dir = command
+            .get_current_dir()
+            .map(|d| PathBuf::from(unix_style(d.to_string_lossy().into_owned())));
+        Ok((args, dir))
+    }
+
+    /// Inputs, outputs and the LUT directory are absolutized, which on Windows
+    /// turns "/clips/a.mp4" into "D:\clips\a.mp4"; map back so the vectors
+    /// pinned below hold on every platform.
+    fn unix_style(path: String) -> String {
+        match path.get(1..3) {
+            Some(":\\") if cfg!(windows) => path[2..].replace('\\', "/"),
+            _ => path,
+        }
     }
 
     fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
