@@ -40,10 +40,10 @@ This project is a Rust workspace with two crates:
 - **Log-profile support** — declare the source with `--input-color` (or its
   older spelling `--profile`) for DJI D-Log, DJI D-Log M (e.g. Avata 2), S-Log,
   C-Log, V-Log, or F-Log footage. On the Rec.709 route the matching conversion
-  LUT under `luts/` is applied automatically. DJI's D-Log (Mavic 4 Pro) and
-  D-Log M LUTs ship with the repository (see [Bundled LUTs](#bundled-luts));
-  for the other profiles, or when `luts/` is not under the working directory,
-  the conversion is skipped with a warning so other adjustments still run.
+  LUT is applied automatically. DJI's D-Log (Mavic 4 Pro) and D-Log M LUTs are
+  built into the binary (see [Bundled LUTs](#bundled-luts)); for the other
+  profiles, put the LUT under `luts/` in the working directory, or the
+  conversion is skipped with a warning so other adjustments still run.
 - **Color enhancement filters** (Rec.709 output; HDR output takes only
   contrast, saturation, `--exposure` and an ACEScct LUT):
   - Contrast and saturation
@@ -362,8 +362,13 @@ download center:
 | `d-log` | `luts/mavic4_pro_dlog_to_rec709.cube` | DJI Mavic 4 Pro D-Log to Rec.709 V1 |
 | `d-log-m` | `luts/dji_dlogm_to_rec709.cube` | DJI Avata 2 D-Log M to Rec.709 V1 (the same file DJI ships for the Mini 4 Pro and Mavic 3 Pro) |
 
-The path is relative to the working directory, so run speedy from the
-repository root (or keep a `luts/` folder next to where you run it).
+Both are compiled into the binary, so release archives and the Nix package
+have them too. On first use speedy writes the LUT to
+`<cache>/speedy/luts/` (`$XDG_CACHE_HOME`, `~/.cache` or `%LOCALAPPDATA%`)
+for ffmpeg to read, and rewrites it if it ever differs. A `luts/` folder in
+the working directory takes precedence, which is also where LUTs for the other
+profiles (`luts/sony_slog_to_rec709.cube`, `luts/canon_clog_to_rec709.cube`)
+are looked for.
 
 ### Available Presets
 

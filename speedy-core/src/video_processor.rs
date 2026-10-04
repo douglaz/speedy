@@ -18,6 +18,19 @@ const HDR_DEFAULT_QUALITY: u8 = 18;
 /// CRF used for Rec.709 output when no quality is set.
 const SDR_DEFAULT_QUALITY: u8 = 23;
 
+/// DJI's conversion LUTs from `luts/`, compiled in so installed binaries
+/// (release archives, the Nix package) have them without a checkout.
+const EMBEDDED_LUTS: [(&str, &str); 2] = [
+    (
+        "mavic4_pro_dlog_to_rec709.cube",
+        include_str!("../../luts/mavic4_pro_dlog_to_rec709.cube"),
+    ),
+    (
+        "dji_dlogm_to_rec709.cube",
+        include_str!("../../luts/dji_dlogm_to_rec709.cube"),
+    ),
+];
+
 /// Everything `ffprobe` (and the filesystem) contributes to a command, gathered
 /// up front so that [`VideoProcessor::plan`] itself is a pure function.
 #[derive(Debug, Clone)]
@@ -423,22 +436,25 @@ impl VideoProcessor {
 
     /// Get the appropriate LUT file for the color profile, if one is available.
     ///
-    /// A missing profile LUT is not fatal: only the DJI LUTs ship in `luts/`,
-    /// and the path is relative to the working directory, so we log a warning
-    /// and skip the color conversion rather than aborting, letting the other
-    /// preset adjustments still apply.
+    /// A `luts/` folder in the working directory wins; otherwise the DJI LUTs
+    /// come from the copies compiled into the binary. A missing profile LUT is
+    /// not fatal: we log a warning and skip the color conversion rather than
+    /// aborting, letting the other preset adjustments still apply.
     fn get_profile_lut(&self) -> Option<PathBuf> {
         let lut_path = self.profile_lut_path()?;
         if lut_path.exists() {
-            Some(lut_path)
-        } else {
-            log::warn!(
-                "{label} LUT not found at {path}; skipping color conversion",
-                label = self.color.input.label(),
-                path = lut_path.display()
-            );
-            None
+            return Some(lut_path);
         }
+        let name = lut_path.file_name()?.to_str()?;
+        if let Some(path) = embedded_lut(name, &user_cache_dir()) {
+            return Some(path);
+        }
+        log::warn!(
+            "{label} LUT not found at {path}; skipping color conversion",
+            label = self.color.input.label(),
+            path = lut_path.display()
+        );
+        None
     }
 
     /// The profile LUT to apply, looked up only when it would be used: an
@@ -451,8 +467,8 @@ impl VideoProcessor {
         self.get_profile_lut()
     }
 
-    /// Where the Rec.709 conversion LUT for the input colour is expected
-    /// (relative to the working directory), whether or not it is installed.
+    /// Where a local Rec.709 conversion LUT for the input colour is looked for
+    /// (relative to the working directory), whether or not it is there.
     pub fn profile_lut_path(&self) -> Option<PathBuf> {
         let path = match self.color.input {
             InputColor::DjiDLogDGamut => "luts/mavic4_pro_dlog_to_rec709.cube",
@@ -1106,6 +1122,48 @@ fn absolutize(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Path of the compiled-in LUT `name` under `cache/speedy/luts`, written there
+/// first when missing or different (ffmpeg's `lut3d` reads a file). `None`
+/// when no LUT of that name is compiled in or the file cannot be written.
+fn embedded_lut(name: &str, cache: &Path) -> Option<PathBuf> {
+    let (_, content) = EMBEDDED_LUTS.iter().find(|(n, _)| *n == name)?;
+    let dir = cache.join("speedy").join("luts");
+    let path = dir.join(name);
+    if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == *content) {
+        return Some(path);
+    }
+    // Write to a per-process name and rename, so concurrent runs never read a
+    // half-written LUT.
+    let tmp = dir.join(format!("{name}.{pid}.tmp", pid = std::process::id()));
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&tmp, content))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    match written {
+        Ok(()) => Some(path),
+        Err(e) => {
+            log::warn!(
+                "Could not write the built-in {name} to {dir}: {e}",
+                dir = dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// The per-user cache directory: `$XDG_CACHE_HOME`, `~/.cache`, or
+/// `%LOCALAPPDATA%`, else the system temp dir.
+fn user_cache_dir() -> PathBuf {
+    let var = |key| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    var("XDG_CACHE_HOME")
+        .or_else(|| var("HOME").map(|home| home.join(".cache")))
+        .or_else(|| var("LOCALAPPDATA"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Validate a speed multiplier. `1.0` (no-op) is fine; otherwise it must be
 /// finite and positive, or `setpts` becomes inf/NaN and the audio `atempo`
 /// chaining loop can spin forever.
@@ -1181,16 +1239,33 @@ mod tests {
 
     #[test]
     fn missing_profile_lut_degrades_to_none() {
-        // LUT assets are git-ignored and not shipped, so a log profile whose
-        // LUT is absent must skip color conversion (None) rather than abort.
-        let lut = PathBuf::from("luts/mavic4_pro_dlog_to_rec709.cube");
+        // No S-Log LUT is shipped or compiled in, so the profile must skip
+        // color conversion (None) rather than abort.
+        let lut = PathBuf::from("luts/sony_slog_to_rec709.cube");
         if lut.exists() {
             // Skip when a developer happens to have the LUT present locally.
             return;
         }
         let processor =
-            VideoProcessor::new("in.mp4", "out.mp4").input_color(crate::InputColor::DjiDLogDGamut);
+            VideoProcessor::new("in.mp4", "out.mp4").input_color(crate::InputColor::SLog);
         assert_eq!(processor.get_profile_lut(), None);
+    }
+
+    #[test]
+    fn embedded_lut_is_written_once_and_repaired() -> Result<()> {
+        let cache =
+            std::env::temp_dir().join(format!("speedy-lut-test-{pid}", pid = std::process::id()));
+        let (name, content) = EMBEDDED_LUTS[1];
+        let path = embedded_lut(name, &cache).context("embedded LUT not written")?;
+        assert_eq!(path, cache.join("speedy/luts/dji_dlogm_to_rec709.cube"));
+        assert_eq!(std::fs::read_to_string(&path)?, content);
+        // A stale or tampered copy is replaced, not trusted.
+        std::fs::write(&path, "LUT_3D_SIZE 2\n")?;
+        embedded_lut(name, &cache).context("embedded LUT not rewritten")?;
+        assert_eq!(std::fs::read_to_string(&path)?, content);
+        assert_eq!(embedded_lut("sony_slog_to_rec709.cube", &cache), None);
+        std::fs::remove_dir_all(&cache)?;
+        Ok(())
     }
 
     #[test]
