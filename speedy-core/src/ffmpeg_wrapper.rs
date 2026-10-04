@@ -27,6 +27,10 @@ pub struct FFmpegCommand {
     /// `(width, height, fps)` and concatenated via the concat filter so clips
     /// of differing resolution/orientation can be stitched into one output.
     concat_normalize: Option<(u32, u32, String)>,
+    /// Appended to each stitched input's `scale` filter: further `scale`
+    /// options and a `format` restriction that fix how the clip is read and
+    /// what reaches the concat filter. Empty leaves both to ffmpeg.
+    concat_input_pin: String,
     /// Known total duration in seconds, used for progress because the concat
     /// filter does not produce a single `Duration` line FFmpeg can report.
     total_duration: Option<f64>,
@@ -67,6 +71,7 @@ impl FFmpegCommand {
             metadata_args: Vec::new(),
             hw_accel: None,
             concat_normalize: None,
+            concat_input_pin: String::new(),
             total_duration: None,
             video_only: false,
             working_dir: None,
@@ -82,6 +87,14 @@ impl FFmpegCommand {
     /// concatenated.
     pub fn concat_normalize(mut self, width: u32, height: u32, fps: &str) -> Self {
         self.concat_normalize = Some((width, height, fps.to_string()));
+        self
+    }
+
+    /// Pin how each stitched input is read and handed to the concat filter:
+    /// `pin` continues the per-input `scale` filter (see
+    /// [`concat_normalize`](Self::concat_normalize)).
+    pub fn concat_input_pin(mut self, pin: &str) -> Self {
+        self.concat_input_pin = pin.to_string();
         self
     }
 
@@ -488,6 +501,7 @@ impl FFmpegCommand {
             // down to fit and padding to keep aspect), concatenate them, then
             // apply the shared video filter chain (e.g. the LUT) once.
             let n = self.inputs.len();
+            let pin = &self.concat_input_pin;
             let mut graph = String::new();
             for i in 0..n {
                 // setpts=PTS-STARTPTS rebases each segment to start at 0, which
@@ -495,7 +509,7 @@ impl FFmpegCommand {
                 // start PTS (trimmed sources, MP4 edit lists) can produce gaps
                 // or non-monotonic-timestamp failures.
                 graph.push_str(&format!(
-                    "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
+                    "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease{pin},\
                      pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},\
                      setpts=PTS-STARTPTS[v{i}];"
                 ));
@@ -790,6 +804,8 @@ pub fn get_video_info(path: impl AsRef<Path>) -> Result<VideoInfo> {
     let fps_regex = Regex::new(r#""r_frame_rate":\s*"(\d+)/(\d+)""#).unwrap();
     let rotation_regex = Regex::new(r#""rotation":\s*(-?\d+)"#).unwrap();
     let audio_regex = Regex::new(r#""codec_type":\s*"audio""#).unwrap();
+    let color_space_regex = Regex::new(r#""color_space":\s*"([^"]+)""#).unwrap();
+    let color_range_regex = Regex::new(r#""color_range":\s*"([^"]+)""#).unwrap();
 
     let duration = duration_regex
         .captures(&json)
@@ -822,6 +838,9 @@ pub fn get_video_info(path: impl AsRef<Path>) -> Result<VideoInfo> {
 
     let has_audio = audio_regex.is_match(&json);
 
+    let color_space = color_space_regex.captures(&json).map(|c| c[1].to_string());
+    let color_range = color_range_regex.captures(&json).map(|c| c[1].to_string());
+
     Ok(VideoInfo {
         duration,
         width,
@@ -829,6 +848,8 @@ pub fn get_video_info(path: impl AsRef<Path>) -> Result<VideoInfo> {
         fps,
         rotation,
         has_audio,
+        color_space,
+        color_range,
     })
 }
 
@@ -840,6 +861,11 @@ pub struct VideoInfo {
     pub fps: f64,
     pub rotation: i32,
     pub has_audio: bool,
+    /// YUV matrix tag of the video stream (ffprobe `color_space`, e.g.
+    /// `bt709`), if the source carries one.
+    pub color_space: Option<String>,
+    /// Colour range tag of the video stream (`tv` or `pc`), if present.
+    pub color_range: Option<String>,
 }
 
 #[cfg(test)]

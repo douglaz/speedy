@@ -10,7 +10,8 @@ all driven by a single `speedy` binary.
 This project is a Rust workspace with two crates:
 
 - **`speedy-core`** — the core library: an FFmpeg command builder, the video
-  processing pipeline, color/log-profile handling, and the built-in presets.
+  processing pipeline, the color pipeline (Rec.709 and HDR), and the built-in
+  presets.
 - **`speedy-cli`** — the command-line interface (`speedy` binary) that parses
   arguments and drives `speedy-core`.
 
@@ -28,12 +29,20 @@ This project is a Rust workspace with two crates:
   are normalized to a common frame (scaled to fit and padded), so mixed 4K/6K
   and portrait/landscape footage can be combined. Any color grading is applied
   once over the joined timeline.
+- **HDR output for DJI D-Log** — D-Log/D-Gamut footage is delivered as
+  Rec.2100 HLG (10-bit HEVC Main 10, ready for a YouTube HDR upload) through a
+  scene-referred ACES pipeline: OpenColorIO converts D-Log/D-Gamut to ACES, the
+  grade runs in ACEScg/ACEScct on 32-bit float RGB, and the ACES 2.0 output
+  transform renders HLG at a 1000-nit reference. No Rec.709 LUT is involved.
+  This is the default for D-Log input; see [HDR Output](#hdr-output-d-log--hlg).
 - **LUT color grading** — apply a `.cube` 3D LUT with `--lut`.
-- **Log-profile support** — declare the source profile (`--profile`) for D-Log,
-  S-Log, C-Log, V-Log, or F-Log footage. When a matching conversion LUT is
-  present under `luts/`, it is applied automatically; if it's missing the
-  conversion is skipped with a warning so other adjustments still run.
-- **Color enhancement filters**:
+- **Log-profile support** — declare the source with `--input-color` (or its
+  older spelling `--profile`) for D-Log, S-Log, C-Log, V-Log, or F-Log footage.
+  On the Rec.709 route, when a matching conversion LUT is present under
+  `luts/` it is applied automatically; if it's missing the conversion is
+  skipped with a warning so other adjustments still run.
+- **Color enhancement filters** (Rec.709 output; HDR output takes only
+  contrast, saturation, `--exposure` and an ACEScct LUT):
   - Contrast and saturation
   - Vibrance (intelligent saturation that protects skin tones)
   - Dehaze (`--dehaze`) — removes atmospheric haze by pulling the black point,
@@ -55,7 +64,8 @@ This project is a Rust workspace with two crates:
     video-only, and 8-bit: the vidstab filters have no 10-bit mode, so ffmpeg
     converts the image down around them. Use `--no-stabilize` to switch off a
     preset's stabilization (`mavic4pro-dlog` and `dji` enable it) and keep an
-    H.265 encode 10-bit end to end.
+    H.265 encode 10-bit end to end. Stabilization is refused with HDR output
+    for the same reason.
 - **Enhancement & cleanup** — denoising (`nlmeans`) and sharpening (`unsharp`).
 - **Encoding control** — codec (H.264, H.265/HEVC, VP9, AV1, ProRes), CRF
   quality, target bitrate, thread count, and output scaling. `libx265` encodes
@@ -79,8 +89,14 @@ This project is a Rust workspace with two crates:
 - **Rust** 1.88 or later (the workspace uses the 2024 edition and let-chains)
 - **FFmpeg** with `ffmpeg` and `ffprobe` on your `PATH`. Use a build that
   includes the encoders for the codecs you intend to use (x264, x265, libvpx,
-  libaom, ProRes). FFmpeg 4.3+ covers all the filters used here; FFmpeg 7 is
-  what the Nix dev shell ships.
+  libaom, ProRes). FFmpeg 4.3+ covers all the filters used for Rec.709
+  output.
+- **For HDR output: FFmpeg with OpenColorIO.** The HDR route needs the `ocio`
+  filter (FFmpeg 8+ configured with `--enable-libopencolorio`, OpenColorIO
+  2.5+) and `zscale` (libzimg). Distribution builds normally lack `ocio`; the
+  Nix dev shell ships FFmpeg 8 built with it, so run HDR jobs inside
+  `nix develop`. speedy checks for the filter and stops with an explanation
+  when it is missing.
 
 Install FFmpeg:
 
@@ -114,9 +130,12 @@ nix build
 # Run it directly
 nix run . -- -i input.mp4 -o output.mp4 --speed 2.0
 
-# Enter the dev shell (FFmpeg, Rust toolchain, git hooks, etc.)
+# Enter the dev shell (FFmpeg with OpenColorIO, Rust toolchain, git hooks, etc.)
 nix develop
 ```
+
+The static binary calls whatever `ffmpeg` is on `PATH`, so HDR output from it
+still needs the dev shell's FFmpeg: `nix develop -c ./result/bin/speedy ...`.
 
 When using Nix for development, prefix cargo commands with `nix develop -c` so
 the FFmpeg environment is available, e.g. `nix develop -c cargo test`.
@@ -136,8 +155,79 @@ speedy -i input.mp4 -o output.mp4 --lut color_grade.cube
 speedy -i drone_footage.mp4 -o processed.mp4 --preset mavic4pro-dlog
 
 # Treat the source as S-Log footage (applies the S-Log LUT if available)
-speedy -i clip.mov -o graded.mp4 --profile s-log
+speedy -i clip.mov -o graded.mp4 --input-color s-log
+
+# DJI D-Log footage to an HDR (Rec.2100 HLG) file for YouTube
+speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog
 ```
+
+### HDR Output (D-Log → HLG)
+
+When the input is DJI D-Log (`--input-color dji-dlog`, or `--profile d-log`),
+no preset is used and `--output-color` is not given, the output is Rec.2100
+HLG. The picture goes through ACES rather than a Rec.709 LUT:
+
+```
+D-Log/D-Gamut YUV → RGB float → ACES (ACEScg / ACEScct) → grade
+  → ACES 2.0 output transform (HLG, 1000 nits) → BT.2020 10-bit HEVC Main 10
+```
+
+HDR needs the dev shell's FFmpeg + OpenColorIO build, and the dev shell does not
+put `speedy` on `PATH`: build the binary once, then run it through the shell.
+
+```bash
+# Build the binary (result/bin/speedy)
+nix build
+
+# D-Log clip to HLG (libx265 Main 10, CRF 18, audio kept)
+nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --profile d-log
+
+# Stitch a folder into a 10× HDR hyperlapse, downscaled to 4K
+nix develop -c ./result/bin/speedy -i /path/to/DCIM/DJI_001 -o hyperlapse_hdr.mp4 \
+  --input-color dji-dlog --speed 10 --scale 3840:-2
+
+# Grade in ACES: +0.5 stop, a little contrast and saturation
+nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
+  --exposure 0.5 --contrast 1.1 --saturation 1.1
+
+# A creative LUT that works on ACEScct values (in and out)
+nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
+  --lut look_acescct.cube --lut-space acescct
+
+# The previous behaviour: Rec.709 through the D-Log LUT
+nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o sdr.mp4 --profile d-log --output-color rec709
+```
+
+What HDR output does and allows:
+
+- **Encode** — `libx265` Main 10, `yuv420p10le`, CRF 18 unless `--quality` is
+  given. The stream is tagged BT.2020 / ARIB STD-B67 (HLG) / BT.2020
+  non-constant-luminance / limited range in both the container and the HEVC
+  bitstream, whatever the source was tagged. `.mp4` is the tested container.
+  `--codec` may be `h265`, `hevc` or `libx265`; any other codec, including the
+  hardware HEVC encoders, is an error.
+- **Grade** — `--exposure <STOPS>` (−3 to 3, a linear gain in ACEScg),
+  `--contrast` (0.3–2.0, around 18% grey in ACEScct), `--saturation` (0.0–2.0,
+  in ACEScct), and `--lut` with `--lut-space acescct`.
+- **Still available** — speed, `--output-fps`, stitching, `--scale` (applied
+  before the color work), `--no-auto-rotate`, `--hw-accel` (decoding),
+  `--bitrate`, `--threads`.
+- **Refused, with an error** — stabilization (`vidstab` is 8-bit only; pass
+  `--no-stabilize`), `--dehaze`, presets, `--curves`, `--vibrance`,
+  `--selective-color`, `--hue-shift`, `--color-balance`, `--denoise`,
+  `--sharpen`, a `--lut` without `--lut-space acescct`, and any input other
+  than DJI D-Log. These were built for a Rec.709 image; use
+  `--output-color rec709` to keep them.
+- **Source tags** — the source's YUV matrix and range tags drive the
+  conversion to RGB. Untagged sources are read as BT.709, limited range (logged
+  as a warning).
+  When stitching, every clip is read with that matrix and range and joined at
+  10 bits, so a stitch may mix tagged and untagged or 8-bit and 10-bit clips;
+  clips whose matrix or range differ are refused.
+
+The OpenColorIO config is the ACES 2.0 studio config built into OpenColorIO
+2.5 (`ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5`), pinned in the code;
+the `OCIO` environment variable is ignored.
 
 ### Stitching Multiple Clips
 
@@ -153,19 +243,23 @@ speedy -i clip1.mp4 clip2.mp4 clip3.mp4 -o combined.mp4
 # Stitch every video in a folder (sorted by filename) and grade from D-Log
 speedy -i /path/to/DCIM/DJI_001 --preset mavic4pro-dlog -o combined.mp4
 
-# Stitch a folder of DJI D-Log clips into a 10× hyperlapse. The speed-up
-# decimates frames back to the source fps, so the output is a short,
-# normal-frame-rate clip (not a ~300 fps file). `--profile d-log` auto-applies
-# the bundled D-Log LUT when one is present under luts/ (and is skipped with a
-# warning otherwise); or grade with your own via `--lut /path/to/your.cube`.
+# Stitch a folder of DJI D-Log clips into a 10× Rec.709 hyperlapse. The
+# speed-up decimates frames back to the source fps, so the output is a short,
+# normal-frame-rate clip (not a ~300 fps file). With `--output-color rec709`,
+# `--profile d-log` auto-applies the bundled D-Log LUT when one is present
+# under luts/ (and is skipped with a warning otherwise); or grade with your own
+# via `--lut /path/to/your.cube`. Without `--output-color rec709` this would be
+# an HDR job (see "HDR Output").
 speedy -i /path/to/DCIM/DJI_001 \
-  --profile d-log --speed 10 --codec h265 -o combined_10x.mp4
+  --profile d-log --output-color rec709 --speed 10 --codec h265 -o combined_10x.mp4
 
-# The full drone pipeline: stitch + D-Log LUT + dehaze + 10× + per-segment
-# stabilization, in one command. Each clip is graded and stabilized on its own
-# before joining, so the stabilizer never invents a pan across a cut.
+# The full Rec.709 drone pipeline: stitch + D-Log LUT + dehaze + 10× +
+# per-segment stabilization, in one command. Each clip is graded and stabilized
+# on its own before joining, so the stabilizer never invents a pan across a
+# cut. Dehaze and stabilization are Rec.709-only, hence `--output-color rec709`.
 speedy -i /path/to/DCIM/DJI_001 \
-  --profile d-log --speed 10 --dehaze 0.2 --stabilize -o combined_10x.mp4
+  --profile d-log --output-color rec709 --speed 10 --dehaze 0.2 --stabilize \
+  -o combined_10x.mp4
 ```
 
 ### Advanced Color Grading
@@ -210,14 +304,18 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 | `--preset <NAME>` | Apply a preset (see below) | — |
 | `-s, --speed <X>` | Speed multiplier (e.g. `2.0`) | `1.0` |
 | `--output-fps <FPS>` | Output frame rate for speed changes (e.g. `30`, `30000/1001`) | source fps |
-| `-l, --lut <FILE>` | `.cube` LUT for color grading | — |
-| `-p, --profile <PROFILE>` | Source profile: `standard`, `d-log`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
-| `-c, --contrast <V>` | Contrast (0.0–2.0) | `1.0` |
-| `-S, --saturation <V>` | Saturation (0.0–2.0) | `1.0` |
-| `--codec <CODEC>` | `h264`, `h265`/`hevc`, `vp9`, `av1`, `prores` | `h264` |
+| `-l, --lut <FILE>` | `.cube` LUT for color grading (HDR: needs `--lut-space acescct`) | — |
+| `--lut-space <SPACE>` | Color space the LUT works in: `acescct` (HDR output only) | — |
+| `--input-color <COLOR>` | Source encoding: `standard`, `dji-dlog`, `s-log`, `c-log`, `v-log`, `f-log` | `standard` |
+| `-p, --profile <PROFILE>` | Older spelling of `--input-color` (`d-log` = `dji-dlog`); the two cannot be combined | `standard` |
+| `--output-color <COLOR>` | `rec709` (SDR) or `hlg` (HDR, Rec.2100 HLG) | `hlg` for D-Log input without a preset, else `rec709` |
+| `--exposure <STOPS>` | Exposure in stops (−3 to 3), in ACEScg (HDR output only) | — |
+| `-c, --contrast <V>` | Contrast (0.0–2.0; HDR: 0.3–2.0, in ACEScct) | `1.0` |
+| `-S, --saturation <V>` | Saturation (0.0–2.0; HDR: in ACEScct) | `1.0` |
+| `--codec <CODEC>` | `h264`, `h265`/`hevc`, `vp9`, `av1`, `prores` (HDR: `h265` only) | `h264` (HDR: `h265`) |
 | `-b, --bitrate <MBPS>` | Target video bitrate in Mbps | — |
-| `-q, --quality <CRF>` | CRF quality (0–51, lower is better) | `23` |
-| `--hw-accel` | Enable hardware acceleration if available | off |
+| `-q, --quality <CRF>` | CRF quality (0–51, lower is better) | `23` (HDR: `18`) |
+| `--hw-accel` | Enable hardware-accelerated decoding if available | off |
 | `-t, --threads <N>` | Number of encoding threads | auto |
 | `--stabilize` | Two-pass vidstab stabilization (per-segment when stitching) | off |
 | `--no-stabilize` | Turn stabilization off, including a preset's | off |
@@ -237,6 +335,11 @@ speedy -i input.mp4 -o output.mp4 --codec h265 --quality 18 --hw-accel
 
 When a preset is used, explicitly passed flags override the preset's values,
 while flags left at their defaults do not clobber what the preset sets.
+
+Presets are Rec.709 grades: with a preset (including `mavic4pro-dlog`) the
+output stays Rec.709, and combining one with `--output-color hlg` is an error.
+The flags from `--stabilize` down to `--selective-color` in the table (except
+`--no-stabilize` and `--no-auto-rotate`) are likewise Rec.709-only.
 
 Run `speedy --help` for the authoritative, always-current list.
 
@@ -317,9 +420,11 @@ speedy/
 ├── speedy-core/          # Core library
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs            # Public API, ColorProfile
+│       ├── lib.rs            # Public API
+│       ├── color.rs          # Color pipeline types, ACES/HDR filter chain
 │       ├── ffmpeg_wrapper.rs # FFmpeg command builder + ffprobe
 │       ├── video_processor.rs# Processing pipeline / stitching
+│       ├── stabilize.rs      # Two-pass vidstab stabilization
 │       └── presets.rs        # Built-in presets
 └── speedy-cli/           # CLI application (`speedy` binary)
     ├── Cargo.toml
@@ -339,12 +444,12 @@ speedy-core = { git = "https://github.com/douglaz/speedy.git" }
 Example usage:
 
 ```rust
-use speedy_core::{ColorProfile, VideoProcessor};
+use speedy_core::{InputColor, VideoProcessor};
 
 fn main() -> anyhow::Result<()> {
     let processor = VideoProcessor::new("input.mp4", "output.mp4")
         .speed(2.0)
-        .profile(ColorProfile::DLog)
+        .input_color(InputColor::DjiDLogDGamut)
         .vibrance(0.5)
         .quality(20);
 
@@ -352,6 +457,23 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+The library's output color defaults to Rec.709 whatever the input (the HLG
+default for D-Log is a CLI choice). Ask for HDR explicitly:
+
+```rust
+use speedy_core::{InputColor, OutputColor, VideoProcessor};
+
+VideoProcessor::new("dlog.mp4", "hdr.mp4")
+    .input_color(InputColor::DjiDLogDGamut)
+    .output_color(OutputColor::Rec2100Hlg)
+    .exposure(0.5)
+    .process()?;
+```
+
+`ColorPipeline { input, working, output }` describes the three stages
+(`WorkingColor` is `AcesCct` or `AcesCg`); `VideoProcessor::validate` reports
+an unsupported combination without running anything.
 
 To stitch multiple clips, build the processor with `VideoProcessor::new_multi`:
 

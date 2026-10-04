@@ -1,12 +1,36 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 
+use crate::color::{self, HdrGrade, SourceYuv};
 use crate::stabilize::{self, VidstabParams};
-use crate::{ColorProfile, FFmpegCommand, check_ffmpeg, get_video_info};
+use crate::{
+    ColorPipeline, FFmpegCommand, InputColor, LutSpace, OutputColor, VideoInfo, WorkingColor,
+    check_ffmpeg, get_video_info,
+};
 
 // Type alias for color balance values (shadows RGB, midtones RGB, highlights RGB)
 type ColorBalanceValues = (f32, f32, f32, f32, f32, f32, f32, f32, f32);
+
+/// x265 CRF used for HDR output when no quality is set: the result is an
+/// upload master that the hosting platform re-encodes.
+const HDR_DEFAULT_QUALITY: u8 = 18;
+/// CRF used for Rec.709 output when no quality is set.
+const SDR_DEFAULT_QUALITY: u8 = 23;
+
+/// Everything `ffprobe` (and the filesystem) contributes to a command, gathered
+/// up front so that [`VideoProcessor::plan`] itself is a pure function.
+#[derive(Debug, Clone)]
+pub struct ProbedInputs {
+    /// One entry per input clip, in order.
+    pub infos: Vec<VideoInfo>,
+    /// Common frame rate that stitched clips are normalized to.
+    pub stitch_fps: String,
+    /// Frame rate a speed change is resampled to, if any.
+    pub target_fps: Option<String>,
+    /// Rec.709 conversion LUT for the input colour, when one is installed.
+    pub profile_lut: Option<PathBuf>,
+}
 
 pub struct VideoProcessor {
     /// One or more input clips. When more than one is given they are stitched
@@ -15,13 +39,23 @@ pub struct VideoProcessor {
     inputs: Vec<PathBuf>,
     output_path: PathBuf,
     speed_multiplier: f64,
-    codec: String,
+    /// `None` picks the default for the output colour (libx264 for Rec.709,
+    /// libx265 for HDR).
+    codec: Option<String>,
     bitrate: Option<u32>,
-    quality: u8,
+    /// `None` picks the default for the output colour.
+    quality: Option<u8>,
     contrast: f32,
     saturation: f32,
-    profile: ColorProfile,
+    color: ColorPipeline,
+    /// Exposure in stops, applied in ACEScg. HDR route only.
+    exposure: Option<f32>,
     lut_file: Option<PathBuf>,
+    /// Colour space the LUT is declared to work in. Required for a LUT on the
+    /// HDR route, where an undeclared (Rec.709) LUT would be wrong.
+    lut_space: Option<LutSpace>,
+    /// Set when a preset configured this processor.
+    preset_applied: bool,
     hw_accel: bool,
     threads: Option<usize>,
     stabilize: bool,
@@ -33,6 +67,9 @@ pub struct VideoProcessor {
     curves: Option<String>,
     hue_shift: Option<f32>,
     color_balance: Option<ColorBalanceValues>,
+    /// Set whenever a colour balance was asked for, even if its value did not
+    /// parse: HDR output refuses the option itself, not just a valid value.
+    color_balance_requested: bool,
     selective_color: Option<String>,
     /// Target output frame rate used when the speed is changed. `None` defaults
     /// to the source frame rate, which makes a speed-up drop frames instead of
@@ -57,13 +94,16 @@ impl VideoProcessor {
             inputs,
             output_path: output.as_ref().to_path_buf(),
             speed_multiplier: 1.0,
-            codec: "libx264".to_string(),
+            codec: None,
             bitrate: None,
-            quality: 23,
+            quality: None,
             contrast: 1.0,
             saturation: 1.0,
-            profile: ColorProfile::Standard,
+            color: ColorPipeline::default(),
+            exposure: None,
             lut_file: None,
+            lut_space: None,
+            preset_applied: false,
             hw_accel: false,
             threads: None,
             stabilize: false,
@@ -75,6 +115,7 @@ impl VideoProcessor {
             curves: None,
             hue_shift: None,
             color_balance: None,
+            color_balance_requested: false,
             selective_color: None,
             output_fps: None,
             dehaze: None,
@@ -110,15 +151,17 @@ impl VideoProcessor {
     }
 
     pub fn codec(mut self, codec: &str) -> Self {
-        self.codec = match codec {
-            "h264" => "libx264",
-            "h265" | "hevc" => "libx265",
-            "vp9" => "libvpx-vp9",
-            "av1" => "libaom-av1",
-            "prores" => "prores_ks",
-            other => other,
-        }
-        .to_string();
+        self.codec = Some(
+            match codec {
+                "h264" => "libx264",
+                "h265" | "hevc" => "libx265",
+                "vp9" => "libvpx-vp9",
+                "av1" => "libaom-av1",
+                "prores" => "prores_ks",
+                other => other,
+            }
+            .to_string(),
+        );
         self
     }
 
@@ -128,7 +171,7 @@ impl VideoProcessor {
     }
 
     pub fn quality(mut self, crf: u8) -> Self {
-        self.quality = crf;
+        self.quality = Some(crf);
         self
     }
 
@@ -142,9 +185,150 @@ impl VideoProcessor {
         self
     }
 
-    pub fn profile(mut self, profile: ColorProfile) -> Self {
-        self.profile = profile;
+    /// Declare what the source footage is encoded as.
+    pub fn input_color(mut self, input: InputColor) -> Self {
+        self.color.input = input;
         self
+    }
+
+    /// Scene-referred working space of the HDR route.
+    pub fn working_color(mut self, working: WorkingColor) -> Self {
+        self.color.working = working;
+        self
+    }
+
+    /// Choose the delivery colour. Rec.709 (the default) keeps the
+    /// display-referred route; Rec.2100 HLG takes the ACES route and needs an
+    /// ffmpeg with the `ocio` filter.
+    pub fn output_color(mut self, output: OutputColor) -> Self {
+        self.color.output = output;
+        self
+    }
+
+    pub fn color_pipeline(mut self, color: ColorPipeline) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// The colour pipeline as configured so far.
+    pub fn color(&self) -> ColorPipeline {
+        self.color
+    }
+
+    /// Exposure compensation in stops, applied as a linear gain in ACEScg.
+    /// Only available with HDR output.
+    pub fn exposure(mut self, stops: f32) -> Self {
+        self.exposure = Some(stops);
+        self
+    }
+
+    /// Declare the colour space the LUT works in (see [`LutSpace`]).
+    pub fn lut_space(mut self, space: LutSpace) -> Self {
+        self.lut_space = Some(space);
+        self
+    }
+
+    pub(crate) fn mark_preset_applied(mut self) -> Self {
+        self.preset_applied = true;
+        self
+    }
+
+    fn effective_codec(&self) -> &str {
+        match &self.codec {
+            Some(codec) => codec,
+            None if self.color.is_hdr() => "libx265",
+            None => "libx264",
+        }
+    }
+
+    fn effective_quality(&self) -> u8 {
+        self.quality.unwrap_or(if self.color.is_hdr() {
+            HDR_DEFAULT_QUALITY
+        } else {
+            SDR_DEFAULT_QUALITY
+        })
+    }
+
+    /// Check the configuration without touching any file or running ffmpeg.
+    ///
+    /// The HDR route is deliberately narrow: only operators that are defined in
+    /// ACES and run on float RGB are allowed, and everything tuned for a
+    /// Rec.709 image is refused rather than silently applied to the wrong
+    /// signal.
+    pub fn validate(&self) -> Result<()> {
+        if !self.color.is_hdr() {
+            ensure!(
+                self.exposure.is_none(),
+                "--exposure is applied in ACEScg and is only available with HDR output (--output-color hlg)"
+            );
+            ensure!(
+                self.lut_space.is_none(),
+                "--lut-space only applies to HDR output (--output-color hlg); Rec.709 output applies the LUT as-is"
+            );
+            return Ok(());
+        }
+
+        ensure!(
+            self.color.input == InputColor::DjiDLogDGamut,
+            "HDR output requires DJI D-Log/D-Gamut input (--input-color dji-dlog); {label} input has no HDR route",
+            label = self.color.input.label()
+        );
+        ensure!(
+            !self.preset_applied,
+            "Presets are Rec.709 grades and cannot be used with HDR output"
+        );
+        ensure!(
+            !self.stabilize,
+            "HDR output requires a 10-bit-safe pipeline. The current vidstab backend is 8-bit only. Use --no-stabilize."
+        );
+        ensure!(self.dehaze.is_none(), "--dehaze is not yet HDR-safe");
+        let rec709_only = [
+            ("--curves", self.curves.is_some()),
+            ("--vibrance", self.vibrance.is_some()),
+            ("--selective-color", self.selective_color.is_some()),
+            ("--hue-shift", self.hue_shift.is_some()),
+            ("--color-balance", self.color_balance_requested),
+            ("--denoise", self.denoise.is_some()),
+            ("--sharpen", self.sharpen.is_some()),
+        ];
+        for (flag, set) in rec709_only {
+            ensure!(
+                !set,
+                "{flag} is not available with HDR output: the HDR grade is limited to --exposure, --contrast, --saturation and an ACEScct --lut"
+            );
+        }
+        ensure!(
+            self.lut_file.is_none() || self.lut_space == Some(LutSpace::AcesCct),
+            "--lut with HDR output must be an ACEScct LUT declared with --lut-space acescct; a Rec.709 LUT cannot be used on the HDR route"
+        );
+
+        let codec = self.effective_codec();
+        if codec != "libx265" {
+            if codec.contains("hevc") || codec.contains("265") {
+                bail!(
+                    "HDR output is only verified with the libx265 software encoder; {codec} is not supported. Use --codec h265."
+                );
+            }
+            bail!("HDR output requires HEVC Main 10 (--codec h265); {codec} cannot carry it");
+        }
+
+        if let Some(stops) = self.exposure {
+            ensure!(
+                stops.is_finite() && stops.abs() <= 3.0,
+                "Invalid --exposure {stops}; must be between -3 and 3 stops"
+            );
+        }
+        ensure!(
+            (0.3..=2.0).contains(&self.contrast),
+            "Invalid --contrast {contrast} for HDR output; must be between 0.3 and 2.0",
+            contrast = self.contrast
+        );
+        ensure!(
+            (0.0..=2.0).contains(&self.saturation),
+            "Invalid --saturation {saturation} for HDR output; must be between 0.0 and 2.0",
+            saturation = self.saturation
+        );
+        Ok(())
     }
 
     pub fn lut(mut self, lut_file: impl AsRef<Path>) -> Self {
@@ -203,6 +387,7 @@ impl VideoProcessor {
     }
 
     pub fn color_balance_str(mut self, balance_str: &str) -> Self {
+        self.color_balance_requested = true;
         // Parse color balance string format: "rs:gs:bs,rm:gm:bm,rh:gh:bh"
         let parts: Vec<&str> = balance_str.split(',').collect();
         if parts.len() == 3 {
@@ -243,20 +428,39 @@ impl VideoProcessor {
     /// color conversion rather than aborting, letting the other preset
     /// adjustments still apply.
     fn get_profile_lut(&self) -> Option<PathBuf> {
-        let (path, label) = match self.profile {
-            ColorProfile::DLog => ("luts/mavic4_pro_dlog_to_rec709.cube", "D-Log"),
-            ColorProfile::SLog => ("luts/sony_slog_to_rec709.cube", "S-Log"),
-            ColorProfile::CLog => ("luts/canon_clog_to_rec709.cube", "C-Log"),
-            _ => return None,
-        };
-
-        let lut_path = PathBuf::from(path);
+        let lut_path = self.profile_lut_path()?;
         if lut_path.exists() {
             Some(lut_path)
         } else {
-            log::warn!("{label} LUT not found at {path}; skipping color conversion");
+            log::warn!(
+                "{label} LUT not found at {path}; skipping color conversion",
+                label = self.color.input.label(),
+                path = lut_path.display()
+            );
             None
         }
+    }
+
+    /// The profile LUT to apply, looked up only when it would be used: an
+    /// explicit `--lut` replaces it, and the HDR route never takes a Rec.709
+    /// LUT.
+    fn wanted_profile_lut(&self) -> Option<PathBuf> {
+        if self.lut_file.is_some() || self.color.is_hdr() {
+            return None;
+        }
+        self.get_profile_lut()
+    }
+
+    /// Where the Rec.709 conversion LUT for the input colour is expected
+    /// (relative to the working directory), whether or not it is installed.
+    pub fn profile_lut_path(&self) -> Option<PathBuf> {
+        let path = match self.color.input {
+            InputColor::DjiDLogDGamut => "luts/mavic4_pro_dlog_to_rec709.cube",
+            InputColor::SLog => "luts/sony_slog_to_rec709.cube",
+            InputColor::CLog => "luts/canon_clog_to_rec709.cube",
+            _ => return None,
+        };
+        Some(PathBuf::from(path))
     }
 
     /// Process the video using FFmpeg CLI
@@ -271,9 +475,15 @@ impl VideoProcessor {
         // infinite atempo chaining loop for 0 / negative / non-finite speeds.
         validate_speed(self.speed_multiplier)?;
 
+        // Refuse an unsupported configuration before any ffmpeg work.
+        self.validate()?;
+
         // Check FFmpeg availability
         let ffmpeg_version = check_ffmpeg()?;
         log::info!("Using FFmpeg version: {}", ffmpeg_version);
+        if self.color.is_hdr() {
+            color::ensure_ocio_filter()?;
+        }
 
         // Get video info from the first clip (all stitched clips are assumed to
         // share the same format, as they come from the same camera/source).
@@ -303,13 +513,73 @@ impl VideoProcessor {
 
         // When multiple clips are given, probe every clip so we can pick a
         // common output resolution and sum the durations (for the progress bar).
-        let stitching = self.inputs.len() > 1;
-        let stitch_plan = if stitching {
-            let infos = self
-                .inputs
+        let infos = if self.inputs.len() > 1 {
+            self.inputs
                 .iter()
                 .map(get_video_info)
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![info.clone()]
+        };
+        // Probe the first video stream's frame rate specifically, so a file
+        // whose first stream is audio/data does not feed a bogus fps into
+        // the concat graph.
+        let stitch_fps = if infos.len() > 1 {
+            probe_video_fps(&self.inputs[0], info.fps)
+        } else {
+            String::new()
+        };
+        let target_fps = self.resolve_target_fps(&info)?;
+        let cmd = self.plan(&ProbedInputs {
+            infos,
+            stitch_fps,
+            target_fps,
+            profile_lut: self.wanted_profile_lut(),
+        })?;
+
+        // Set up progress bar
+        let pb = ProgressBar::new(100);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}% {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        // Execute FFmpeg with progress tracking
+        let pb_clone = pb.clone();
+        cmd.execute(move |progress, message| {
+            pb_clone.set_position(progress as u64);
+            if progress >= 100.0 {
+                pb_clone.finish_with_message("Processing complete!");
+            } else {
+                pb_clone.set_message(message);
+            }
+        })?;
+
+        log::info!("Video processing completed successfully!");
+        log::info!("Output saved to: {:?}", self.output_path);
+
+        Ok(())
+    }
+
+    /// Build the single ffmpeg command for an unstabilized run from already
+    /// probed inputs. Pure: no file or process is touched, so the argument
+    /// vector can be inspected (and is pinned by tests).
+    pub fn plan(&self, probed: &ProbedInputs) -> Result<FFmpegCommand> {
+        // `plan` is public: a bad speed must not reach the atempo chaining loop.
+        validate_speed(self.speed_multiplier)?;
+        self.validate()?;
+        ensure!(
+            probed.infos.len() == self.inputs.len() && !self.inputs.is_empty(),
+            "Expected probe results for {inputs} input(s), got {infos}",
+            inputs = self.inputs.len(),
+            infos = probed.infos.len()
+        );
+        let info = &probed.infos[0];
+
+        let stitch_plan = if self.inputs.len() > 1 {
+            let infos = &probed.infos;
             let total: f64 = infos.iter().map(|i| i.duration).sum();
             // Target the smallest display size across clips so nothing is
             // upscaled; clips of other sizes are scaled to fit and padded.
@@ -345,18 +615,14 @@ impl VideoProcessor {
         } else {
             FFmpegCommand::new(&abs_inputs[0], &abs_output)
         }
-        .video_codec(&self.codec)
-        .quality(self.quality)
+        .video_codec(self.effective_codec())
+        .quality(self.effective_quality())
         .overwrite()
         .preserve_metadata();
 
         if let Some((width, height, total)) = stitch_plan {
-            // Probe the first video stream's frame rate specifically, so a file
-            // whose first stream is audio/data does not feed a bogus fps into
-            // the concat graph.
-            let fps = probe_video_fps(&self.inputs[0], info.fps);
             cmd = cmd
-                .concat_normalize(width, height, &fps)
+                .concat_normalize(width, height, &probed.stitch_fps)
                 .total_duration(total);
         }
 
@@ -387,34 +653,81 @@ impl VideoProcessor {
             }
         }
 
-        // Apply the grade: speed, LUT, dehaze, colour, rotation, scaling, etc.
-        let target_fps = self.resolve_target_fps(&info)?;
-        cmd = self.apply_grade(cmd, &info, target_fps.as_deref());
+        let target_fps = probed.target_fps.as_deref();
+        if self.color.is_hdr() {
+            self.apply_hdr_grade(cmd, &probed.infos, target_fps)
+        } else {
+            // Apply the grade: speed, LUT, dehaze, colour, rotation, scaling, etc.
+            Ok(self.apply_grade_with_lut(cmd, info, target_fps, probed.profile_lut.clone()))
+        }
+    }
 
-        // Set up progress bar
-        let pb = ProgressBar::new(100);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}% {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+    /// The HDR route: geometry on the camera's own 10-bit YUV first (so the
+    /// float colour work only touches pixels that survive), then the ACES chain
+    /// from [`color::hdr_filters`], then explicit HLG signaling.
+    fn apply_hdr_grade(
+        &self,
+        mut cmd: FFmpegCommand,
+        infos: &[VideoInfo],
+        target_fps: Option<&str>,
+    ) -> Result<FFmpegCommand> {
+        let info = &infos[0];
+        let source =
+            SourceYuv::from_tags(info.color_space.as_deref(), info.color_range.as_deref())?;
+        // Stitched clips share one conversion to RGB after the join.
+        for other in &infos[1..] {
+            ensure!(
+                SourceYuv::from_tags(other.color_space.as_deref(), other.color_range.as_deref())?
+                    == source,
+                "Stitched clips must share one YUV matrix and range for HDR output"
+            );
+        }
+        if infos.len() > 1 {
+            // Left to itself the concat filter converts every clip to the
+            // first one's format and tags, guessing BT.601 for an untagged one.
+            cmd = cmd.concat_input_pin(&color::stitch_input_pin(source));
+        }
 
-        // Execute FFmpeg with progress tracking
-        let pb_clone = pb.clone();
-        cmd.execute(move |progress, message| {
-            pb_clone.set_position(progress as u64);
-            if progress >= 100.0 {
-                pb_clone.finish_with_message("Processing complete!");
-            } else {
-                pb_clone.set_message(message);
+        if self.speed_multiplier != 1.0 {
+            cmd = cmd.speed(self.speed_multiplier, info.has_audio, target_fps);
+        }
+        if !self.auto_rotate {
+            cmd = cmd.disable_autorotate();
+        }
+        if let Some(ref scale_str) = self.scale {
+            let Some((width, height)) = parse_scale(scale_str) else {
+                bail!(
+                    "Malformed --scale {scale_str:?}; expected e.g. \"1920x1080\" or \"1920:-1\""
+                );
+            };
+            cmd = cmd.scale(width, height);
+        }
+
+        // Reference the LUT by basename from its own directory, as on the
+        // Rec.709 route (see apply_grade_with_lut).
+        let lut_name = match &self.lut_file {
+            Some(lut) => {
+                if let Some(parent) = lut.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    cmd = cmd.current_dir(absolutize(parent));
+                }
+                let name = lut
+                    .file_name()
+                    .with_context(|| format!("Invalid LUT path: {path}", path = lut.display()))?;
+                Some(name.to_string_lossy().into_owned())
             }
-        })?;
+            None => None,
+        };
 
-        log::info!("Video processing completed successfully!");
-        log::info!("Output saved to: {:?}", self.output_path);
-
-        Ok(())
+        let grade = HdrGrade {
+            exposure: self.exposure.unwrap_or(0.0),
+            contrast: self.contrast,
+            saturation: self.saturation,
+            lut: lut_name.as_deref(),
+        };
+        for filter in color::hdr_filters(self.color.working, source, &grade) {
+            cmd = cmd.video_filter(&filter);
+        }
+        Ok(cmd.custom_args(color::hlg_output_args()))
     }
 
     /// Resolve the decimation target frame rate for a speed change. `None` when
@@ -446,9 +759,21 @@ impl VideoProcessor {
     /// by the single-command path and the per-clip stabilization path.
     fn apply_grade(
         &self,
+        cmd: FFmpegCommand,
+        info: &crate::VideoInfo,
+        target_fps: Option<&str>,
+    ) -> FFmpegCommand {
+        self.apply_grade_with_lut(cmd, info, target_fps, self.wanted_profile_lut())
+    }
+
+    /// [`apply_grade`](Self::apply_grade) with the profile LUT lookup already
+    /// done by the caller.
+    fn apply_grade_with_lut(
+        &self,
         mut cmd: FFmpegCommand,
         info: &crate::VideoInfo,
         target_fps: Option<&str>,
+        profile_lut: Option<PathBuf>,
     ) -> FFmpegCommand {
         // Speed (resampled to the target fps so a speed-up drops frames).
         if self.speed_multiplier != 1.0 {
@@ -466,12 +791,12 @@ impl VideoProcessor {
         // colons/backslashes/commas (Windows drives, odd dirs) isn't mis-parsed
         // as filtergraph syntax. Input/output paths are absolute, so changing
         // the working directory is safe.
-        let lut = self.lut_file.clone().or_else(|| self.get_profile_lut());
+        let lut = self.lut_file.clone().or(profile_lut);
         if let Some(lut) = lut {
             if self.lut_file.is_none() {
                 log::info!(
                     "Applying {} profile LUT: {}",
-                    self.profile.to_string(),
+                    self.color.input.label(),
                     lut.display()
                 );
             }
@@ -563,7 +888,7 @@ impl VideoProcessor {
         let target_fps = self.resolve_target_fps(info)?;
         // High-quality intermediates so the extra encode generation before the
         // warp does not visibly degrade the grade.
-        let inter_q = self.quality.min(16);
+        let inter_q = self.effective_quality().min(16);
 
         // Unique per-call temp dir: the pid alone collides across concurrent
         // VideoProcessor runs in one process, which would clobber intermediates.
@@ -599,8 +924,8 @@ impl VideoProcessor {
     ) -> Result<()> {
         // Final-encode settings, mirrored so --bitrate/--threads are honored.
         let enc = stabilize::EncodeOpts {
-            codec: &self.codec,
-            quality: self.quality,
+            codec: self.effective_codec(),
+            quality: self.effective_quality(),
             bitrate: self.bitrate,
             threads: self.threads,
         };
@@ -615,7 +940,7 @@ impl VideoProcessor {
             let mut clip_info = info.clone();
             clip_info.has_audio = false;
             let mut cmd = FFmpegCommand::new(absolutize(&self.inputs[0]), &graded)
-                .video_codec(&self.codec)
+                .video_codec(self.effective_codec())
                 .quality(inter_q)
                 .video_only()
                 .overwrite();
@@ -673,7 +998,7 @@ impl VideoProcessor {
             clip_info.has_audio = false;
             let graded = tmp.join(format!("graded_{i}.mkv"));
             let mut cmd = FFmpegCommand::new(absolutize(clip), &graded)
-                .video_codec(&self.codec)
+                .video_codec(self.effective_codec())
                 .quality(inter_q)
                 .video_only()
                 .overwrite()
@@ -837,6 +1162,8 @@ mod tests {
             fps: 30.0,
             rotation,
             has_audio: false,
+            color_space: None,
+            color_range: None,
         }
     }
 
@@ -860,7 +1187,8 @@ mod tests {
             // Skip when a developer happens to have the LUT present locally.
             return;
         }
-        let processor = VideoProcessor::new("in.mp4", "out.mp4").profile(crate::ColorProfile::DLog);
+        let processor =
+            VideoProcessor::new("in.mp4", "out.mp4").input_color(crate::InputColor::DjiDLogDGamut);
         assert_eq!(processor.get_profile_lut(), None);
     }
 
@@ -985,6 +1313,119 @@ mod tests {
     fn absolutize_makes_relative_paths_absolute() {
         // A relative path becomes absolute (joined with cwd); cross-platform.
         assert!(absolutize(Path::new("rel/x.mp4")).is_absolute());
+    }
+
+    fn graph_of(cmd: &crate::FFmpegCommand) -> String {
+        let built = cmd.build();
+        let args: Vec<String> = built
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .expect("expected -filter_complex");
+        args[idx + 1].clone()
+    }
+
+    fn probed(infos: Vec<VideoInfo>) -> ProbedInputs {
+        ProbedInputs {
+            infos,
+            stitch_fps: "30/1".to_string(),
+            target_fps: Some("30/1".to_string()),
+            profile_lut: None,
+        }
+    }
+
+    #[test]
+    fn plan_rejects_invalid_speed() {
+        // Without the check, an input with audio spins forever in the atempo
+        // chaining loop.
+        let with_audio = VideoInfo {
+            has_audio: true,
+            ..info(1920, 1080, 0)
+        };
+        for bad in [0.0, -1.0, f64::NAN] {
+            let result = VideoProcessor::new("in.mp4", "out.mp4")
+                .speed(bad)
+                .plan(&probed(vec![with_audio.clone()]));
+            assert!(result.is_err(), "speed {bad} should be rejected by plan");
+        }
+    }
+
+    #[test]
+    fn malformed_color_balance_is_still_refused_with_hdr_output() {
+        let hdr = |balance: &str| {
+            VideoProcessor::new("in.mp4", "out.mp4")
+                .input_color(crate::InputColor::DjiDLogDGamut)
+                .output_color(crate::OutputColor::Rec2100Hlg)
+                .color_balance_str(balance)
+                .validate()
+        };
+        for balance in ["oops", "0.1:0:0,0:0:0,0:0:0.1"] {
+            let error = hdr(balance).expect_err("HDR must refuse --color-balance");
+            assert!(
+                error
+                    .to_string()
+                    .contains("--color-balance is not available with HDR output"),
+                "{balance}: {error}"
+            );
+        }
+        // Rec.709 output keeps warning and ignoring a malformed value.
+        let sdr = VideoProcessor::new("in.mp4", "out.mp4").color_balance_str("oops");
+        assert!(sdr.validate().is_ok());
+        assert_eq!(sdr.color_balance, None);
+    }
+
+    #[test]
+    fn hdr_stitch_pins_every_input_to_the_resolved_matrix_and_10_bit() -> Result<()> {
+        // An untagged clip resolves to BT.709 limited, the same as the tagged
+        // one, so both must be read that way and neither narrowed to 8 bits.
+        let tagged = VideoInfo {
+            color_space: Some("bt709".to_string()),
+            color_range: Some("tv".to_string()),
+            ..info(1920, 1080, 0)
+        };
+        let hdr = |inputs: Vec<PathBuf>| {
+            VideoProcessor::new_multi(inputs, "out.mp4")
+                .input_color(crate::InputColor::DjiDLogDGamut)
+                .output_color(crate::OutputColor::Rec2100Hlg)
+        };
+        let two = || vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")];
+        let pin = "force_original_aspect_ratio=decrease:in_color_matrix=bt709:out_color_matrix=bt709:in_range=limited:out_range=limited,format=yuv420p10le|yuv422p10le|yuv444p10le,pad=";
+        for infos in [
+            vec![info(1920, 1080, 0), tagged.clone()],
+            vec![tagged.clone(), tagged.clone()],
+            vec![info(1920, 1080, 0), info(1920, 1080, 0)],
+        ] {
+            let graph = graph_of(&hdr(two()).plan(&probed(infos))?);
+            assert_eq!(graph.matches(pin).count(), 2, "{graph}");
+        }
+
+        // Clips that resolve to different matrices are still refused.
+        let bt2020 = VideoInfo {
+            color_space: Some("bt2020nc".to_string()),
+            ..tagged.clone()
+        };
+        assert!(
+            hdr(two())
+                .plan(&probed(vec![tagged.clone(), bt2020]))
+                .is_err()
+        );
+
+        // A single HDR clip and a Rec.709 stitch carry no pin.
+        let single =
+            graph_of(&hdr(vec![PathBuf::from("a.mp4")]).plan(&probed(vec![tagged.clone()]))?);
+        assert!(!single.contains("in_color_matrix"), "{single}");
+        let sdr = VideoProcessor::new_multi(two(), "out.mp4")
+            .plan(&probed(vec![info(1920, 1080, 0), tagged]))?;
+        assert_eq!(
+            graph_of(&sdr),
+            "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v0];\
+             [1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v1];\
+             [v0][v1]concat=n=2:v=1[cat];[cat]format=yuv420p[v]"
+        );
+        Ok(())
     }
 
     #[test]
