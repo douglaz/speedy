@@ -40,6 +40,21 @@ const ACESCCT_MID_GREY: f64 = 0.413_588_4;
 /// AP1 luminance weights (R, G, B), used by the saturation operator.
 const AP1_LUMA: [f64; 3] = [0.272_228_72, 0.674_081_77, 0.053_689_52];
 
+/// HDR dehaze at strength 1.0. Haze is light scattered into the view: a
+/// near-uniform veil added in linear light. The veil is subtracted in
+/// scene-linear ACEScg (measured on hazy D-Log footage: the darkest 1% sat at
+/// 0.04-0.06, where clear aerial shadows sit near 0.01), with the gain
+/// renormalized so the pivot keeps its value: shadows deepen without dimming
+/// the frame or lifting highlights. Subtraction alone reads as darker rather
+/// than clearer, so dehaze also adds ACEScct contrast and saturation,
+/// multiplied into --contrast and --saturation.
+const DEHAZE_VEIL: f64 = 0.1;
+/// Scene-linear ACEScg value the veil subtraction leaves unchanged: a sunlit
+/// midtone, the median of the footage the dehaze was tuned on.
+const DEHAZE_PIVOT: f64 = 0.3;
+const DEHAZE_CONTRAST: f64 = 0.3;
+const DEHAZE_SATURATION: f64 = 0.7;
+
 /// What the source footage is encoded as.
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum InputColor {
@@ -175,6 +190,8 @@ pub struct HdrGrade<'a> {
     pub contrast: f32,
     /// ACEScct saturation (1.0 = identity).
     pub saturation: f32,
+    /// Dehaze strength, 0.0 (off) to 1.0.
+    pub dehaze: f32,
     /// File name of an ACEScct-to-ACEScct 3D LUT, relative to ffmpeg's
     /// working directory.
     pub lut: Option<&'a str>,
@@ -277,8 +294,16 @@ pub(crate) fn hdr_filters(
     source: SourceYuv,
     grade: &HdrGrade,
 ) -> Vec<String> {
-    let has_cct_ops = grade.contrast != 1.0 || grade.saturation != 1.0 || grade.lut.is_some();
-    let mut space = if grade.exposure != 0.0 {
+    let haze = f64::from(grade.dehaze);
+    let contrast = f64::from(grade.contrast) * (1.0 + DEHAZE_CONTRAST * haze);
+    // Applied one after the other, which composes exactly: colorchannelmixer
+    // caps coefficients at +/-2, which a single combined factor above ~2.05
+    // would exceed, while each factor alone stays inside.
+    let saturations = [f64::from(grade.saturation), 1.0 + DEHAZE_SATURATION * haze];
+    let linear_ops = grade.exposure != 0.0 || haze > 0.0;
+    let has_cct_ops =
+        contrast != 1.0 || saturations.iter().any(|&s| s != 1.0) || grade.lut.is_some();
+    let mut space = if linear_ops {
         WorkingColor::AcesCg
     } else if has_cct_ops {
         WorkingColor::AcesCct
@@ -291,7 +316,14 @@ pub(crate) fn hdr_filters(
         ocio_colorspace(OCIO_DJI_DLOG, space.ocio_name()),
     ];
 
-    if grade.exposure != 0.0 {
+    if haze > 0.0 {
+        // out = 2^exposure * pivot / (pivot - veil) * (in - veil). The filter
+        // computes (in - black) / (2^-stops - black), so solve for stops.
+        let veil = DEHAZE_VEIL * haze;
+        let gain = f64::from(grade.exposure).exp2() * DEHAZE_PIVOT / (DEHAZE_PIVOT - veil);
+        let stops = -(1.0 / gain + veil).log2();
+        filters.push(format!("exposure=exposure={stops:.6}:black={veil:.6}"));
+    } else if grade.exposure != 0.0 {
         // (in - black) * 2^stops with black = 0: a pure linear gain.
         filters.push(format!(
             "exposure=exposure={stops:.4}:black=0",
@@ -307,18 +339,16 @@ pub(crate) fn hdr_filters(
             ));
             space = WorkingColor::AcesCct;
         }
-        if grade.contrast != 1.0 {
+        if contrast != 1.0 {
             // out = (in - pivot) * contrast + pivot. `exposure` is the float
             // filter with a gain and an offset: it computes
             // (in - black) / (2^-exposure - black), so solve for both.
-            let contrast = f64::from(grade.contrast);
             let black = ACESCCT_MID_GREY * (1.0 - 1.0 / contrast);
             let exposure = -(ACESCCT_MID_GREY + (1.0 - ACESCCT_MID_GREY) / contrast).log2();
             filters.push(format!("exposure=exposure={exposure:.6}:black={black:.6}"));
         }
-        if grade.saturation != 1.0 {
-            // out = luma + saturation * (in - luma), as a 3x3 matrix.
-            let s = f64::from(grade.saturation);
+        for s in saturations.into_iter().filter(|&s| s != 1.0) {
+            // out = luma + s * (in - luma), as a 3x3 matrix.
             let [r, g, b] = AP1_LUMA.map(|w| w * (1.0 - s));
             filters.push(format!(
                 "colorchannelmixer=rr={rr:.6}:rg={g:.6}:rb={b:.6}:gr={r:.6}:gg={gg:.6}:gb={b:.6}:br={r:.6}:bg={g:.6}:bb={bb:.6}",
@@ -382,6 +412,7 @@ mod tests {
         exposure: 0.0,
         contrast: 1.0,
         saturation: 1.0,
+        dehaze: 0.0,
         lut: None,
     };
 
@@ -434,6 +465,7 @@ mod tests {
             exposure: 1.0,
             contrast: 2.0,
             saturation: 0.0,
+            dehaze: 0.0,
             lut: Some("look.cube"),
         };
         let filters = hdr_filters(WorkingColor::AcesCct, BT709_TV, &grade);
@@ -475,6 +507,82 @@ mod tests {
             filters[3].contains(":input='ACEScg':display="),
             "{filters:?}"
         );
+    }
+
+    #[test]
+    fn dehaze_subtracts_the_veil_in_acescg_and_adds_contrast_and_saturation() {
+        let grade = HdrGrade {
+            exposure: 0.7,
+            dehaze: 0.5,
+            ..NO_GRADE
+        };
+        let filters = hdr_filters(WorkingColor::AcesCct, BT709_TV, &grade);
+        assert_eq!(
+            filters[1],
+            format!(
+                "ocio=config={QUOTED_CONFIG}:input='D-Log D-Gamut':output='ACEScg':format=gbrpf32le"
+            )
+        );
+        // Veil 0.05 subtracted, gain 2^0.7 * 0.3 / 0.25 so 0.3 keeps its value.
+        assert_eq!(filters[2], "exposure=exposure=0.828853:black=0.050000");
+        assert!(
+            filters[3].contains(":input='ACEScg':output='ACEScct':"),
+            "{filters:?}"
+        );
+        // Contrast 1.15 and saturation 1.35.
+        assert_eq!(filters[4], "exposure=exposure=0.114798:black=0.053946");
+        assert_eq!(
+            filters[5],
+            "colorchannelmixer=rr=1.254720:rg=-0.235929:rb=-0.018791:gr=-0.095280:gg=1.114071:gb=-0.018791:br=-0.095280:bg=-0.235929:bb=1.331209"
+        );
+        assert!(
+            filters[6].contains(":input='ACEScct':display="),
+            "{filters:?}"
+        );
+        assert_eq!(filters.len(), 8, "{filters:?}");
+    }
+
+    #[test]
+    fn dehaze_multiplies_into_contrast_and_alone_still_runs_in_acescg() {
+        let grade = HdrGrade {
+            contrast: 1.2,
+            dehaze: 0.5,
+            ..NO_GRADE
+        };
+        let filters = hdr_filters(WorkingColor::AcesCct, BT709_TV, &grade);
+        // No exposure: the veil comes off with no extra gain beyond the pivot's.
+        assert_eq!(filters[2], "exposure=exposure=0.178970:black=0.050000");
+        // 1.2 * 1.15 = 1.38.
+        assert_eq!(filters[4], "exposure=exposure=0.254075:black=0.113887");
+    }
+
+    #[test]
+    fn strongest_saturation_and_dehaze_stay_within_ffmpeg_option_ranges() {
+        // colorchannelmixer takes coefficients in [-2, 2] and exposure takes
+        // exposure in [-3, 3] and black in [-1, 1]; ffmpeg refuses the graph
+        // otherwise.
+        for (exposure, contrast, saturation) in [(3.0, 2.0, 2.0), (-3.0, 0.3, 0.0)] {
+            let grade = HdrGrade {
+                exposure,
+                contrast,
+                saturation,
+                dehaze: 1.0,
+                ..NO_GRADE
+            };
+            for filter in hdr_filters(WorkingColor::AcesCct, BT709_TV, &grade) {
+                let (limit, options) = match filter.split_once('=') {
+                    Some(("colorchannelmixer", options)) => (2.0, options),
+                    Some(("exposure", options)) => (3.0, options),
+                    _ => continue,
+                };
+                for option in options.split(':') {
+                    let (name, value) = option.split_once('=').expect("name=value");
+                    let value: f64 = value.parse().expect("number");
+                    let limit = if name == "black" { 1.0 } else { limit };
+                    assert!(value.abs() <= limit, "{option} out of range in {filter}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -989,7 +1097,10 @@ mod tests {
         let grade = HdrGrade {
             exposure: 0.5,
             contrast: 1.2,
-            saturation: 1.3,
+            // The strongest saturation and dehaze, so ffmpeg also checks
+            // every generated option against its range.
+            saturation: 2.0,
+            dehaze: 1.0,
             lut: Some("identity.cube"),
         };
         let chain = hdr_filters(WorkingColor::AcesCct, BT709_TV, &grade).join(",");

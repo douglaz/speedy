@@ -136,9 +136,10 @@ struct Args {
     #[arg(long)]
     vibrance: Option<f32>,
 
-    /// Remove atmospheric haze at the given strength (~0.5 medium, 1.0 strong;
-    /// clamped to 0.0-1.0). Pulls the black point, adds contrast, and restores
-    /// saturation/vibrance.
+    /// Remove atmospheric haze at the given strength (~0.5 medium, 1.0 strong).
+    /// Rec.709: clamped to 0.0-1.0; pulls the black point, adds contrast, and
+    /// restores saturation/vibrance. HDR: must be 0.0-1.0; subtracts the haze
+    /// veil in linear ACEScg and adds ACEScct contrast and saturation.
     #[arg(long, value_name = "STRENGTH")]
     dehaze: Option<f32>,
 
@@ -1263,6 +1264,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn hdr_dehaze_reaches_the_aces_chain() -> Result<()> {
+        let (args, _) = plan(&with(&SINGLE, &["--profile", "d-log", "--dehaze", "0.5"]))?;
+        assert_hdr_encode(&args, "18");
+        let graph = value_after(&args, "-filter_complex").context("no graph")?;
+        let stages = [
+            "input='D-Log D-Gamut':output='ACEScg'",
+            "exposure=exposure=0.828853:black=0.050000",
+            "input='ACEScg':output='ACEScct'",
+            "exposure=exposure=0.114798:black=0.053946",
+            "colorchannelmixer=rr=1.254720:",
+            "input='ACEScct':display='Rec.2100-HLG - Display'",
+        ];
+        let positions: Vec<usize> = stages
+            .iter()
+            .map(|stage| {
+                graph
+                    .find(stage)
+                    .with_context(|| format!("no {stage} in {graph}"))
+            })
+            .collect::<Result<_>>()?;
+        assert!(positions.is_sorted(), "{positions:?} in {graph}");
+        Ok(())
+    }
+
     // ---- HDR hard errors.
 
     const HLG: [&str; 4] = ["--input-color", "dji-dlog", "--output-color", "hlg"];
@@ -1274,7 +1300,7 @@ mod tests {
                 &["--stabilize"],
                 "HDR output requires a 10-bit-safe pipeline. The current vidstab backend is 8-bit only. Use --no-stabilize.",
             ),
-            (&["--dehaze", "0.5"], "--dehaze is not yet HDR-safe"),
+            (&["--dehaze", "1.5"], "Invalid --dehaze 1.5 for HDR output"),
             (
                 &["--curves", "preset=lighter"],
                 "--curves is not available with HDR output",

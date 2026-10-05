@@ -45,7 +45,7 @@ This project is a Rust workspace with two crates:
   profiles, put the LUT under `luts/` in the working directory, or the
   conversion is skipped with a warning so other adjustments still run.
 - **Color enhancement filters** (Rec.709 output; HDR output takes only
-  contrast, saturation, `--exposure` and an ACEScct LUT):
+  contrast, saturation, `--exposure`, `--dehaze` and an ACEScct LUT):
   - Contrast and saturation
   - Vibrance (intelligent saturation that protects skin tones)
   - Dehaze (`--dehaze`) — removes atmospheric haze by pulling the black point,
@@ -196,6 +196,10 @@ nix develop -c ./result/bin/speedy -i /path/to/DCIM/DJI_001 -o hyperlapse_hdr.mp
 nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
   --exposure 1.0 --contrast 1.1 --saturation 1.1
 
+# Hazy daylight footage
+nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
+  --dehaze 0.5
+
 # A creative LUT that works on ACEScct values (in and out)
 nix develop -c ./result/bin/speedy -i DJI_0001.MP4 -o hdr.mp4 --input-color dji-dlog \
   --lut look_acescct.cube --lut-space acescct
@@ -216,12 +220,20 @@ What HDR output does and allows:
   0.7, which lifts 18% grey from the ~30% HLG signal the ACES 2.0 rendering
   gives it to the 38% HLG reference level; a value you pass replaces it),
   `--contrast` (0.3–2.0, around 18% grey in ACEScct), `--saturation` (0.0–2.0,
-  in ACEScct), and `--lut` with `--lut-space acescct`.
+  in ACEScct), `--dehaze` (0.0–1.0, see below), and `--lut` with
+  `--lut-space acescct`.
+- **Dehaze** — haze is scattered light added over the scene, so HDR
+  `--dehaze` subtracts it as a black offset in scene-linear ACEScg (up to 0.1
+  at strength 1.0) and raises the gain so a sunlit midtone keeps its value:
+  shadows deepen while highlights barely move. It then adds ACEScct contrast
+  and saturation (1.15 and 1.35 at strength 0.5), multiplied into `--contrast`
+  and `--saturation`. The offset is the same across the frame, so distant
+  haze, which is thicker, is reduced less than near haze.
 - **Still available** — speed, `--output-fps`, stitching, `--scale` (applied
   before the color work), `--no-auto-rotate`, `--hw-accel` (decoding),
   `--bitrate`, `--threads`.
 - **Refused, with an error** — stabilization (`vidstab` is 8-bit only; pass
-  `--no-stabilize`), `--dehaze`, presets, `--curves`, `--vibrance`,
+  `--no-stabilize`), presets, `--curves`, `--vibrance`,
   `--selective-color`, `--hue-shift`, `--color-balance`, `--denoise`,
   `--sharpen`, a `--lut` without `--lut-space acescct`, and any input other
   than DJI D-Log — D-Log M included, since DJI publishes a LUT for it but no
@@ -265,7 +277,7 @@ speedy -i /path/to/DCIM/DJI_001 \
 # The full Rec.709 drone pipeline: stitch + D-Log LUT + dehaze + 10× +
 # per-segment stabilization, in one command. Each clip is graded and stabilized
 # on its own before joining, so the stabilizer never invents a pan across a
-# cut. Dehaze and stabilization are Rec.709-only, hence `--output-color rec709`.
+# cut. Stabilization is Rec.709-only, hence `--output-color rec709`.
 speedy -i /path/to/DCIM/DJI_001 \
   --profile d-log --output-color rec709 --speed 10 --dehaze 0.2 --stabilize \
   -o combined_10x.mp4

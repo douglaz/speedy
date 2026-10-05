@@ -294,7 +294,12 @@ impl VideoProcessor {
             !self.stabilize,
             "HDR output requires a 10-bit-safe pipeline. The current vidstab backend is 8-bit only. Use --no-stabilize."
         );
-        ensure!(self.dehaze.is_none(), "--dehaze is not yet HDR-safe");
+        if let Some(strength) = self.dehaze {
+            ensure!(
+                (0.0..=1.0).contains(&strength),
+                "Invalid --dehaze {strength} for HDR output; must be between 0.0 and 1.0"
+            );
+        }
         let rec709_only = [
             ("--curves", self.curves.is_some()),
             ("--vibrance", self.vibrance.is_some()),
@@ -307,7 +312,7 @@ impl VideoProcessor {
         for (flag, set) in rec709_only {
             ensure!(
                 !set,
-                "{flag} is not available with HDR output: the HDR grade is limited to --exposure, --contrast, --saturation and an ACEScct --lut"
+                "{flag} is not available with HDR output: the HDR grade is limited to --exposure, --contrast, --saturation, --dehaze and an ACEScct --lut"
             );
         }
         ensure!(
@@ -739,6 +744,7 @@ impl VideoProcessor {
             exposure: self.exposure.unwrap_or(color::HLG_DEFAULT_EXPOSURE),
             contrast: self.contrast,
             saturation: self.saturation,
+            dehaze: self.dehaze.unwrap_or(0.0),
             lut: lut_name.as_deref(),
         };
         for filter in color::hdr_filters(self.color.working, source, &grade) {
