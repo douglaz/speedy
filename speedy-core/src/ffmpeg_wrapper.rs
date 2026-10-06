@@ -211,9 +211,10 @@ impl FFmpegCommand {
     /// If `has_audio` is false, only video speed is adjusted.
     pub fn speed(mut self, multiplier: f64, has_audio: bool, output_fps: Option<&str>) -> Self {
         if multiplier != 1.0 {
-            // Video speed adjustment
-            self.video_filters
-                .push(format!("setpts={:.4}*PTS", 1.0 / multiplier));
+            // Video speed adjustment. Speed factors are written with `{}`, the
+            // shortest exact form, never rounded: 1/6 as 0.1667 stretches the
+            // timeline enough to skip a frame every ~5000.
+            self.video_filters.push(format!("setpts=PTS/{multiplier}"));
 
             // Resample the retimed stream to a sane frame rate so the output fps
             // does not scale with the speed multiplier. Placed right after
@@ -226,7 +227,7 @@ impl FFmpegCommand {
             // Audio speed adjustment (with pitch correction) - only if audio exists
             if has_audio {
                 if (0.5..=2.0).contains(&multiplier) {
-                    self.audio_filters.push(format!("atempo={:.4}", multiplier));
+                    self.audio_filters.push(format!("atempo={multiplier}"));
                 } else {
                     // For speeds outside 0.5-2.0 range, chain multiple atempo filters
                     let mut current = multiplier;
@@ -235,7 +236,7 @@ impl FFmpegCommand {
                         current /= 2.0;
                     }
                     if current > 1.0 {
-                        self.audio_filters.push(format!("atempo={:.4}", current));
+                        self.audio_filters.push(format!("atempo={current}"));
                     }
 
                     while current < 0.5 {
@@ -243,7 +244,7 @@ impl FFmpegCommand {
                         current *= 2.0;
                     }
                     if current < 1.0 {
-                        self.audio_filters.push(format!("atempo={:.4}", current));
+                        self.audio_filters.push(format!("atempo={current}"));
                     }
                 }
             }
@@ -1013,7 +1014,35 @@ mod tests {
                 .build(),
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
-        assert_eq!(fc, "[0:v]setpts=0.1000*PTS,fps=30,format=yuv420p[v]");
+        assert_eq!(fc, "[0:v]setpts=PTS/10,fps=30,format=yuv420p[v]");
+        Ok(())
+    }
+
+    #[test]
+    fn speed_factors_are_exact_not_rounded() -> Result<()> {
+        // 1/6 rounded to 0.1667 stretches the timeline by 0.02%, so the fps
+        // filter keeps a 2-frame step instead of 3 every ~5000 output frames.
+        // Audio rounded the same way drifts out of sync.
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(6.0, true, Some("60000/1001"))
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(fc.contains("[0:v]setpts=PTS/6,fps=60000/1001,"), "fc: {fc}");
+        assert!(
+            fc.contains("[0:a]atempo=2.0,atempo=2.0,atempo=1.5[a]"),
+            "fc: {fc}"
+        );
+
+        let args = args_of(
+            &FFmpegCommand::new("in.mp4", "out.mp4")
+                .speed(4.0 / 3.0, true, None)
+                .build(),
+        );
+        let fc = filter_complex(&args).context("expected -filter_complex")?;
+        assert!(fc.contains("setpts=PTS/1.3333333333333333,"), "fc: {fc}");
+        assert!(fc.contains("[0:a]atempo=1.3333333333333333[a]"), "fc: {fc}");
         Ok(())
     }
 
@@ -1026,7 +1055,7 @@ mod tests {
                 .build(),
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
-        assert_eq!(fc, "[0:v]setpts=0.5000*PTS,format=yuv420p[v]");
+        assert_eq!(fc, "[0:v]setpts=PTS/2,format=yuv420p[v]");
         Ok(())
     }
 
@@ -1043,7 +1072,7 @@ mod tests {
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert_eq!(
             fc,
-            "[0:v]setpts=0.1000*PTS,fps=30,lut3d=file='grade.cube',format=yuv420p[v]"
+            "[0:v]setpts=PTS/10,fps=30,lut3d=file='grade.cube',format=yuv420p[v]"
         );
         Ok(())
     }
@@ -1059,10 +1088,10 @@ mod tests {
         );
         let fc = filter_complex(&args).context("expected -filter_complex")?;
         assert!(
-            fc.contains("[0:v]setpts=0.2500*PTS,fps=30,format=yuv420p[v]"),
+            fc.contains("[0:v]setpts=PTS/4,fps=30,format=yuv420p[v]"),
             "fc: {fc}"
         );
-        assert!(fc.contains("[0:a]atempo=2.0,atempo=2.0000[a]"), "fc: {fc}");
+        assert!(fc.contains("[0:a]atempo=2.0,atempo=2[a]"), "fc: {fc}");
         Ok(())
     }
 

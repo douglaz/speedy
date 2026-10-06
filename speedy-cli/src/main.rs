@@ -622,7 +622,7 @@ mod tests {
                     "-i",
                     "/clips/a.mp4",
                     "-filter_complex",
-                    "[0:v]setpts=0.5000*PTS,fps=30/1,format=yuv420p[v]; [0:a]atempo=2.0000[a]",
+                    "[0:v]setpts=PTS/2,fps=30/1,format=yuv420p[v]; [0:a]atempo=2[a]",
                     "-map",
                     "[v]",
                     "-map",
@@ -762,7 +762,7 @@ mod tests {
                     "-i",
                     "/clips/a.mp4",
                     "-filter_complex",
-                    "[0:v]setpts=0.1000*PTS,fps=30/1,lut3d=file='mavic4_pro_dlog_to_rec709.cube',curves=all='0.050/0 1/1',eq=contrast=1.075:saturation=1.175:gamma=1.030,vibrance=intensity=0.450,format=yuv420p[v]; [0:a]atempo=2.0,atempo=2.0,atempo=2.0,atempo=1.2500[a]",
+                    "[0:v]setpts=PTS/10,fps=30/1,lut3d=file='mavic4_pro_dlog_to_rec709.cube',curves=all='0.050/0 1/1',eq=contrast=1.075:saturation=1.175:gamma=1.030,vibrance=intensity=0.450,format=yuv420p[v]; [0:a]atempo=2.0,atempo=2.0,atempo=2.0,atempo=1.25[a]",
                     "-map",
                     "[v]",
                     "-map",
@@ -803,7 +803,7 @@ mod tests {
                     "-i",
                     "/clips/b.mp4",
                     "-filter_complex",
-                    "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v0];[1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v1];[v0][v1]concat=n=2:v=1[cat];[cat]setpts=0.1000*PTS,fps=30/1,lut3d=file='mavic4_pro_dlog_to_rec709.cube',format=yuv420p10le[v]",
+                    "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v0];[1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30/1,setpts=PTS-STARTPTS[v1];[v0][v1]concat=n=2:v=1[cat];[cat]setpts=PTS/10,fps=30/1,lut3d=file='mavic4_pro_dlog_to_rec709.cube',format=yuv420p10le[v]",
                     "-map",
                     "[v]",
                     "-c:v",
@@ -1179,15 +1179,12 @@ mod tests {
             let graph = value_after(&args, "-filter_complex").context("no graph")?;
             assert!(
                 graph.starts_with(
-                    "[0:v]setpts=0.2500*PTS,fps=30/1,scale=1920:-1,zscale=matrixin=709:rangein=limited:matrix=gbr:range=full,format=gbrpf32le,ocio="
+                    "[0:v]setpts=PTS/4,fps=30/1,scale=1920:-1,zscale=matrixin=709:rangein=limited:matrix=gbr:range=full,format=gbrpf32le,ocio="
                 ),
                 "{graph}"
             );
             // Audio follows the speed change, as on the SDR route.
-            assert!(
-                graph.ends_with("; [0:a]atempo=2.0,atempo=2.0000[a]"),
-                "{graph}"
-            );
+            assert!(graph.ends_with("; [0:a]atempo=2.0,atempo=2[a]"), "{graph}");
         }
         Ok(())
     }
@@ -1205,7 +1202,7 @@ mod tests {
         );
         assert!(
             graph.contains(
-                "[v0][v1]concat=n=2:v=1[cat];[cat]setpts=0.1000*PTS,fps=30/1,zscale=matrixin=709:rangein=limited:matrix=gbr:range=full,format=gbrpf32le,ocio="
+                "[v0][v1]concat=n=2:v=1[cat];[cat]setpts=PTS/10,fps=30/1,zscale=matrixin=709:rangein=limited:matrix=gbr:range=full,format=gbrpf32le,ocio="
             ),
             "{graph}"
         );
