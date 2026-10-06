@@ -586,6 +586,14 @@ impl FFmpegCommand {
         if let Some(ref codec) = self.video_codec {
             cmd.args(["-c:v", codec]);
             cmd.args(["-pix_fmt", out_fmt]);
+            // x265 defaults to open GOPs: every keyframe after the first is a
+            // CRA whose leading frames reference the previous GOP. YouTube cuts
+            // uploads at keyframes and transcodes the pieces separately, and on
+            // open-GOP HEVC it drops a piece's first GOP and shows the next one
+            // twice. Closed GOPs make every keyframe an IDR.
+            if codec == "libx265" {
+                cmd.args(["-flags", "+cgop"]);
+            }
         }
 
         // Audio codec
@@ -984,6 +992,25 @@ mod tests {
             assert!(fc.ends_with("format=yuv420p[v]"), "{eight_bit} fc: {fc}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn x265_encodes_closed_gops_and_other_encoders_are_untouched() {
+        // Open-GOP HEVC makes YouTube drop a GOP and repeat the next one at
+        // each of its processing chunk boundaries.
+        let args_for = |codec: &str| {
+            args_of(
+                &FFmpegCommand::new("in.mp4", "out.mp4")
+                    .video_codec(codec)
+                    .build(),
+            )
+        };
+        let x265 = args_for("libx265");
+        assert!(has_pair(&x265, "-flags", "+cgop"), "{x265:?}");
+        for codec in ["libx264", "libvpx-vp9", "hevc_vaapi", "prores_ks"] {
+            let args = args_for(codec);
+            assert!(!args.iter().any(|a| a == "-flags"), "{codec}: {args:?}");
+        }
     }
 
     #[test]
